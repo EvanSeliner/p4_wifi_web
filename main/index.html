@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Gamepad all buttons</title>
+    <style>
+      body { font-family: system-ui, Arial; padding: 12px; max-width: 760px; }
+      .btn { display:flex; gap:12px; align-items:center; padding:6px 0; }
+      .dot { width:12px; height:12px; border-radius:50%; background:#ccc; }
+      .dot.pressed { background:#0a0; }
+      .val { color:#555; font-family: monospace; }
+    </style>
+  </head>
+  <body>
+    <h1>Gamepad buttons</h1>
+    <p id="status">Waiting for gamepad…</p>
+    <div id="buttons"></div>
+
+    <script>
+      const statusEl = document.getElementById("status");
+      const buttonsEl = document.getElementById("buttons");
+
+      let gpIndex = null;
+      let raf = null;
+
+      function ensureButtons(count) {
+        // create/update button elements to match count
+        while (buttonsEl.childElementCount < count) {
+          const row = document.createElement("div");
+          row.className = "btn";
+          row.innerHTML = `
+            <div class="dot" aria-hidden></div>
+            <div>
+              <div class="label"></div>
+              <div class="val"></div>
+            </div>
+          `;
+          buttonsEl.appendChild(row);
+        }
+        // remove extras
+        while (buttonsEl.childElementCount > count) {
+          buttonsEl.removeChild(buttonsEl.lastChild);
+        }
+      }
+
+      function renderButtons(buttons) {
+        ensureButtons(buttons.length);
+        for (let i = 0; i < buttons.length; i++) {
+          const b = buttons[i];
+          const row = buttonsEl.children[i];
+          const dot = row.querySelector(".dot");
+          const label = row.querySelector(".label");
+          const val = row.querySelector(".val");
+
+          if (b.pressed) dot.classList.add("pressed");
+          else dot.classList.remove("pressed");
+
+          label.textContent = `Button ${i}`;
+          // show pressed boolean and analog value if present
+          val.textContent = `pressed: ${b.pressed}  value: ${Number(b.value).toFixed(3)}`;
+        }
+      }
+
+      function poll() {
+        const gps = navigator.getGamepads ? navigator.getGamepads() : [];
+        const g = (gpIndex != null) ? gps[gpIndex] : null;
+
+        if (g) {
+          statusEl.textContent = `Gamepad: ${g.id} (index ${g.index})`;
+          renderButtons(g.buttons);
+        } else {
+          statusEl.textContent = "No gamepad connected";
+          buttonsEl.innerHTML = "";
+        }
+
+        raf = requestAnimationFrame(poll);
+      }
+
+      window.addEventListener("gamepadconnected", (e) => {
+        gpIndex = e.gamepad.index;
+        console.log("connected", e.gamepad);
+        if (raf == null) poll();
+      });
+
+      window.addEventListener("gamepaddisconnected", (e) => {
+        if (gpIndex === e.gamepad.index) gpIndex = null;
+        console.log("disconnected", e.gamepad);
+      });
+
+      // If a gamepad is already connected when page loads, pick the first one.
+      window.addEventListener("load", () => {
+        const gps = navigator.getGamepads ? navigator.getGamepads() : [];
+        for (let i = 0; i < gps.length; i++) {
+          if (gps[i]) {
+            gpIndex = gps[i].index;
+            break;
+          }
+        }
+        poll();
+      });
+
+      // Note for mobile Chrome: some devices require a user interaction (tap)
+      // before delivering input events. If you see only an initial update,
+      // tap the page once after connecting the controller.
+    </script>
+  </body>
+</html>
