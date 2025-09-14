@@ -22,16 +22,16 @@
 
 // --- WiFi via Hosted/Remote ---
 #include "esp_wifi_remote.h"                  // provided by esp_wifi_remote (host API)
-#include "wifi_provisioning/manager.h" // (pulled by earlier setup; harmless if unused)
+
 
 // --- Driver / GPIO / I2C / I2S ---
 #include "driver/gpio.h"
-#include "driver/i2c_master.h"
+#include "driver/i2c.h"
 #include "driver/i2s_std.h"
 
 // --- ES8311 codec ---
 #include "es8311.h"
-#include "es8311_reg.h"
+
 
 static const char *TAG = "P4+C6+SND";
 
@@ -55,29 +55,10 @@ static const char *TAG = "P4+C6+SND";
 #define AP_CHAN       6
 #define HOSTNAME      "esp-p4"
 
-// Simple HTML page with metrics, a “Sound On/Off” button and links
-static const char *INDEX_HTML =
-"<!doctype html><html><head><meta charset='utf-8'/>"
-"<meta name=viewport content='width=device-width,initial-scale=1'/>"
-"<title>ESP32-P4 Control</title>"
-"<style>body{font-family:sans-serif;margin:20px} button{padding:10px 16px;font-size:16px}</style>"
-"</head><body>"
-"<h1>ESP32-P4 Web UI</h1>"
-"<p id=stat>loading...</p>"
-"<video id=v autoplay muted playsinline style='max-width:100%;border:1px solid #ddd'></video>"
-"<div style='margin-top:16px'>"
-"  <button onclick='toggleSound()' id=btn>Sound: Off</button>"
-"</div>"
-"<script>\n"
-"async function refresh(){"
-"  try{let r=await fetch('/status');let t=await r.text();document.getElementById('stat').textContent=t.trim()}catch(e){console.log(e)}"
-"} setInterval(refresh,1000);refresh();\n"
-"const v=document.getElementById('v'); v.src='/video';\n"
-"async function toggleSound(){"
-"  let r=await fetch('/sound/toggle',{method:'POST'});"
-"  let s=await r.text(); document.getElementById('btn').textContent='Sound: '+s;"
-"}\n"
-"</script></body></html>";
+/* ---------------- HTTP server ---------------- */
+
+extern const uint8_t index_html_start[] asm("_binary_index_html_start");
+extern const uint8_t index_html_end[]   asm("_binary_index_html_end");
 
 /* ---------------- Wi-Fi Hosted glue (P4 host talks to C6 over SDIO) ---------------- */
 
@@ -86,6 +67,8 @@ static EventGroupHandle_t s_ev;
 
 static void ip_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
   if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+    ip_event_got_ip_t* event = (ip_event_got_ip_t*) data;
+    ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
     xEventGroupSetBits(s_ev, BIT_GOT_IP);
   }
 }
@@ -121,7 +104,7 @@ static void wifi_ap_start(void)
 
 /* ---------------- Audio: ES8311 + I²S ---------------- */
 
-static i2c_master_bus_handle_t s_i2c_bus = NULL;
+
 static i2s_chan_handle_t s_i2s_tx = NULL;
 static es8311_handle_t s_es = NULL;
 static volatile bool s_play = false;
@@ -138,15 +121,16 @@ static esp_err_t audio_hw_init(void)
   gpio_set_level(AMP_ENABLE, 0); // start muted
 
   // I2C0 for ES8311 control (addr 0x18 by default)
-  i2c_master_bus_config_t i2c_cfg = {
-    .i2c_port = I2C0_PORT,
+  i2c_config_t i2c_cfg = {
+    .mode = I2C_MODE_MASTER,
     .sda_io_num = I2C0_SDA,
     .scl_io_num = I2C0_SCL,
-    .clk_source = I2C_CLK_SRC_DEFAULT,
-    .glitch_ignore_cnt = 7,
-    .flags.enable_internal_pullup = false,
+    .sda_pullup_en = GPIO_PULLUP_ENABLE,
+    .scl_pullup_en = GPIO_PULLUP_ENABLE,
+    .master.clk_speed = 100000
   };
-  ESP_ERROR_CHECK( i2c_new_master_bus(&i2c_cfg, &s_i2c_bus) );
+  ESP_ERROR_CHECK( i2c_param_config(I2C0_PORT, &i2c_cfg) );
+  ESP_ERROR_CHECK( i2c_driver_install(I2C0_PORT, i2c_cfg.mode, 0, 0, 0) );
 
   // I2S TX setup (44.1 kHz, 16-bit stereo)
   i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
@@ -167,25 +151,16 @@ static esp_err_t audio_hw_init(void)
   ESP_ERROR_CHECK( i2s_channel_init_std_mode(s_i2s_tx, &std) );
 
   // ES8311 init
+  s_es = es8311_create(I2C0_PORT, ES8311_ADDRESS_0);
+
   es8311_clock_config_t clk = {
-    .mclk_in_hz = 44100 * 256,   // common MCLK = fs*256
-    .mclk_src   = ES8311_MCLK_FROM_MCLK_PIN
+    .mclk_from_mclk_pin = true,
+    .mclk_frequency = 44100 * 256,
+    .sample_frequency = 44100
   };
-  es8311_codec_config_t cfg = {
-    .i2c_port        = (i2c_port_t)I2C0_PORT,
-    .i2c_addr        = ES8311_ADDRRES_0,  // 0x18
-    .clk_cfg         = clk,
-    .adc_input       = ES8311_ADC_INPUT_LINE1, // mic path unused here
-    .dac_output      = ES8311_DAC_OUTPUT_ALL,
-    .dac_output_mixer= ES8311_DAC_OUTPUT_MIXER_ONLY_DAC,
-    .codec_mode      = ES8311_CODEC_MODE_DECODE,
-    .format          = ES8311_I2S_NORMAL,
-    .bits            = ES8311_BIT_LENGTH_16BITS,
-    .sample_frequence= 44100,
-  };
-  ESP_ERROR_CHECK( es8311_new(&cfg, &s_es) );
-  ESP_ERROR_CHECK( es8311_init(s_es) );
-  ESP_ERROR_CHECK( es8311_set_voice_volume(s_es, 80) ); // 0-100
+
+  ESP_ERROR_CHECK( es8311_init(s_es, &clk, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16) );
+  ESP_ERROR_CHECK( es8311_voice_volume_set(s_es, 80, NULL) ); // 0-100
 
   ESP_ERROR_CHECK( i2s_channel_enable(s_i2s_tx) );
 
@@ -233,7 +208,8 @@ static void get_metrics(metrics_t *m) {
 static esp_err_t root_get(httpd_req_t *r)
 {
   httpd_resp_set_type(r, "text/html");
-  return httpd_resp_send(r, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+  const size_t len = index_html_end - index_html_start;
+  return httpd_resp_send(r, (const char*)index_html_start, len);
 }
 
 static esp_err_t status_get(httpd_req_t *r)
@@ -273,14 +249,8 @@ static httpd_handle_t start_web(void)
   ESP_ERROR_CHECK( httpd_start(&h, &cfg) );
 
   httpd_uri_t u_root = { .uri="/", .method=HTTP_GET, .handler=root_get };
-  httpd_uri_t u_stat = { .uri="/status", .method=HTTP_GET, .handler=status_get };
-  httpd_uri_t u_vid  = { .uri="/video", .method=HTTP_GET, .handler=video_get };
-  httpd_uri_t u_tgl  = { .uri="/sound/toggle", .method=HTTP_POST, .handler=sound_toggle_post };
 
   httpd_register_uri_handler(h, &u_root);
-  httpd_register_uri_handler(h, &u_stat);
-  httpd_register_uri_handler(h, &u_vid);
-  httpd_register_uri_handler(h, &u_tgl);
   return h;
 }
 
@@ -288,6 +258,7 @@ static httpd_handle_t start_web(void)
 
 void app_main(void)
 {
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
   ESP_LOGI(TAG, "Boot!");
 
   // Basic init
@@ -302,7 +273,7 @@ void app_main(void)
 
   // Hosted base transport (C6 over SDIO) is initialized by components auto-init.
   // Try STA for ~10s, then AP fallback (matches what you saw in logs).
-  wifi_sta_start("YOUR_STA_SSID", "YOUR_STA_PASSWORD");
+  wifi_sta_start("DaeganSmells", "0123456789");
   esp_event_handler_instance_t inst;
   ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, ip_evt, NULL, &inst));
   EventBits_t r = xEventGroupWaitBits(s_ev, BIT_GOT_IP, pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));

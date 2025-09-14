@@ -1,6 +1,7 @@
 idf_component_register(
   SRCS "main.c"
   INCLUDE_DIRS "."
+  EMBED_FILES "index.html"
   PRIV_REQUIRES
     esp_wifi_remote
     esp_hosted
