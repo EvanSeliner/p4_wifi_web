@@ -2,21 +2,55 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>Gamepad all buttons</title>
+    <title>ESP32-P4 Video + Gamepad</title>
     <style>
-      body { font-family: system-ui, Arial; padding: 12px; max-width: 760px; }
+      body { font-family: system-ui, Arial; padding: 12px; max-width: 960px; margin: 0 auto; }
+      h1 { text-align: center; }
+      .container { display: flex; gap: 24px; }
+      .video-container { flex: 3; }
+      .controls-container { flex: 2; }
+      #video-player { width: 100%; background-color: #000; }
       .btn { display:flex; gap:12px; align-items:center; padding:6px 0; }
       .dot { width:12px; height:12px; border-radius:50%; background:#ccc; }
       .dot.pressed { background:#0a0; }
       .val { color:#555; font-family: monospace; }
     </style>
+    <script src="https://cdn.jsdelivr.net/gh/mbebenita/Broadway/Player/Broadway.js"></script>
   </head>
   <body>
-    <h1>Gamepad buttons</h1>
-    <p id="status">Waiting for gamepad…</p>
-    <div id="buttons"></div>
+    <h1>ESP32-P4 Video + Gamepad</h1>
+    <div class="container">
+      <div class="video-container" id="video-container">
+        <h2>Video Stream</h2>
+        <canvas id="video-player"></canvas>
+      </div>
+      <div class="controls-container">
+        <h2>Gamepad</h2>
+        <p id="status">Waiting for gamepad…</p>
+        <div id="buttons"></div>
+      </div>
+    </div>
 
     <script>
+      // --- Video WebSocket ---
+      const videoPlayer = new Player({
+        useWorker: true,
+        webgl: 'auto',
+        size: { width: 640, height: 480 }
+      });
+      document.getElementById('video-container').appendChild(videoPlayer.canvas);
+
+      const ws = new WebSocket(`ws://${window.location.host}/ws`);
+      ws.binaryType = 'arraybuffer';
+      ws.onmessage = (event) => {
+        // Broadway player expects a Uint8Array
+        const frame = new Uint8Array(event.data);
+        videoPlayer.decode(frame);
+      };
+      ws.onopen = () => console.log('Video WebSocket connected');
+      ws.onclose = () => console.log('Video WebSocket disconnected');
+
+      // --- Gamepad Logic ---
       const statusEl = document.getElementById("status");
       const buttonsEl = document.getElementById("buttons");
 
@@ -24,7 +58,6 @@
       let raf = null;
 
       function ensureButtons(count) {
-        // create/update button elements to match count
         while (buttonsEl.childElementCount < count) {
           const row = document.createElement("div");
           row.className = "btn";
@@ -37,7 +70,6 @@
           `;
           buttonsEl.appendChild(row);
         }
-        // remove extras
         while (buttonsEl.childElementCount > count) {
           buttonsEl.removeChild(buttonsEl.lastChild);
         }
@@ -56,7 +88,6 @@
           else dot.classList.remove("pressed");
 
           label.textContent = `Button ${i}`;
-          // show pressed boolean and analog value if present
           val.textContent = `pressed: ${b.pressed}  value: ${Number(b.value).toFixed(3)}`;
         }
       }
@@ -87,7 +118,6 @@
         console.log("disconnected", e.gamepad);
       });
 
-      // If a gamepad is already connected when page loads, pick the first one.
       window.addEventListener("load", () => {
         const gps = navigator.getGamepads ? navigator.getGamepads() : [];
         for (let i = 0; i < gps.length; i++) {
@@ -98,10 +128,6 @@
         }
         poll();
       });
-
-      // Note for mobile Chrome: some devices require a user interaction (tap)
-      // before delivering input events. If you see only an initial update,
-      // tap the page once after connecting the controller.
     </script>
   </body>
 </html>

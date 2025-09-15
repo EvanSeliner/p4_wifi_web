@@ -6,8 +6,8 @@ idf_component_register(INCLUDE_DIRS include
                     SRCS ${src_wifi_is_remote}
                          ${src_wifi_remote_eppp}
                          dummy_src.c    # Prevents making this component potentially INTERFACE only
-                    REQUIRES esp_event esp_netif esp_wifi
-                    PRIV_REQUIRES esp-tls vfs)
+                    REQUIRES esp_event esp_netif
+                    PRIV_REQUIRES esp_wifi esp-tls vfs)
 
 
 set(IDF_VER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/idf_v${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}")
