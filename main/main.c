@@ -13,6 +13,7 @@
 #include "freertos/event_groups.h"
 
 #include "esp_system.h"
+#include "esp_chip_info.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_event.h"
@@ -347,6 +348,7 @@ static bool     s_cam_ok = false;
 static char     s_cam_card[32] = {0};
 static char     s_cam_bus[32]  = {0};
 static uint16_t s_cam_w = 0, s_cam_h = 0;
+static char     s_devnode[16]  = {0};
 
 // Helper: list /dev and locate a /dev/videoX node
 static void dump_dev_dir(void){
@@ -367,6 +369,96 @@ static const char* find_video_node(void){
     }
     return NULL;
 }
+
+// --------------------- I2C/SCCB smoke test helpers ---------------------
+#if CONFIG_P4_DEBUG_ENABLE_I2C_SMOKE
+static esp_err_t i2c_smoke_init(void){
+    if (CONFIG_P4_SCCB_SDA_GPIO < 0 || CONFIG_P4_SCCB_SCL_GPIO < 0) {
+        LOGW("I2C smoke: pins not set (menu: P4 Debug Options)");
+        return ESP_ERR_INVALID_ARG;
+    }
+    i2c_config_t c = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = CONFIG_P4_SCCB_SDA_GPIO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_io_num = CONFIG_P4_SCCB_SCL_GPIO,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = CONFIG_P4_I2C_SMOKE_SPEED_HZ
+    };
+    esp_err_t e = i2c_param_config(CONFIG_P4_SCCB_PORT, &c);
+    if (e != ESP_OK) return e;
+    return i2c_driver_install(CONFIG_P4_SCCB_PORT, I2C_MODE_MASTER, 0, 0, 0);
+}
+
+static bool i2c_probe_addr(uint8_t addr7){
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (addr7<<1) | I2C_MASTER_WRITE, true);
+    i2c_master_stop(cmd);
+    esp_err_t e = i2c_master_cmd_begin(CONFIG_P4_SCCB_PORT, cmd, pdMS_TO_TICKS(50));
+    i2c_cmd_link_delete(cmd);
+    return e == ESP_OK;
+}
+
+static bool ov5647_read_id(uint8_t addr7, uint8_t *id_high, uint8_t *id_low){
+    // Read 0x300A then 0x300B
+    uint8_t reg = 0x30, sub = 0x0A;
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (addr7<<1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg, true);
+    i2c_master_write_byte(cmd, sub, true);
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (addr7<<1) | I2C_MASTER_READ, true);
+    i2c_master_read_byte(cmd, id_high, I2C_MASTER_NACK);
+    i2c_master_stop(cmd);
+    if (i2c_master_cmd_begin(CONFIG_P4_SCCB_PORT, cmd, pdMS_TO_TICKS(50)) != ESP_OK){ i2c_cmd_link_delete(cmd); return false; }
+    i2c_cmd_link_delete(cmd);
+
+    reg = 0x30; sub = 0x0B;
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (addr7<<1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg, true);
+    i2c_master_write_byte(cmd, sub, true);
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (addr7<<1) | I2C_MASTER_READ, true);
+    i2c_master_read_byte(cmd, id_low, I2C_MASTER_NACK);
+    i2c_master_stop(cmd);
+    bool ok = (i2c_master_cmd_begin(CONFIG_P4_SCCB_PORT, cmd, pdMS_TO_TICKS(50)) == ESP_OK);
+    i2c_cmd_link_delete(cmd);
+    return ok;
+}
+
+static void sccb_smoke_test(void){
+    if (i2c_smoke_init() != ESP_OK) return;
+#if CONFIG_P4_DEBUG_TOGGLE_RESET
+    if (CONFIG_P4_SCCB_RESET_GPIO >= 0){
+        gpio_set_direction(CONFIG_P4_SCCB_RESET_GPIO, GPIO_MODE_OUTPUT);
+        // Try an active-low pulse then release
+        gpio_set_level(CONFIG_P4_SCCB_RESET_GPIO, 0); vTaskDelay(pdMS_TO_TICKS(50));
+        gpio_set_level(CONFIG_P4_SCCB_RESET_GPIO, 1); vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    if (CONFIG_P4_SCCB_PWDN_GPIO >= 0){
+        gpio_set_direction(CONFIG_P4_SCCB_PWDN_GPIO, GPIO_MODE_OUTPUT);
+        // Toggle PWDN both ways
+        gpio_set_level(CONFIG_P4_SCCB_PWDN_GPIO, 1); vTaskDelay(pdMS_TO_TICKS(50));
+        gpio_set_level(CONFIG_P4_SCCB_PWDN_GPIO, 0); vTaskDelay(pdMS_TO_TICKS(120));
+    }
+#endif
+    LOGW("I2C smoke: scanning on port %d SDA=%d SCL=%d speed=%d",
+         CONFIG_P4_SCCB_PORT, CONFIG_P4_SCCB_SDA_GPIO, CONFIG_P4_SCCB_SCL_GPIO, CONFIG_P4_I2C_SMOKE_SPEED_HZ);
+    for (uint8_t a=0x08; a<0x78; ++a){ if (i2c_probe_addr(a)) LOGI("I2C ACK at 0x%02X", a); }
+    uint8_t cand[2] = {0x36, 0x21};
+    for (int i=0;i<2;i++){
+        uint8_t hi=0, lo=0; uint8_t a=cand[i];
+        if (i2c_probe_addr(a) && ov5647_read_id(a, &hi, &lo))
+            LOGI("OV5647? addr=0x%02X ID=0x%02X 0x%02X (expect 0x56 0x47)", a, hi, lo);
+        else
+            LOGW("addr 0x%02X: no ID", a);
+    }
+}
+#endif // CONFIG_P4_DEBUG_ENABLE_I2C_SMOKE
 
 // Safer JSON format strings (avoid heavy escaping in snprintf lines)
 static const char PAD_JSON_FMT[] =
@@ -533,6 +625,44 @@ static esp_err_t dev_get(httpd_req_t *r){
     return httpd_resp_send_chunk(r, NULL, 0);
 }
 
+// HTTP: /probe — re-run camera probe and return JSON
+static void cam_probe_once(void); // forward
+static esp_err_t probe_get(httpd_req_t *r){
+    httpd_resp_set_type(r, "application/json");
+    s_cam_ok=false; s_cam_card[0]=s_cam_bus[0]=0; s_cam_w=s_cam_h=0; s_devnode[0]=0;
+    cam_probe_once();
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"dev\":\"%s\",\"ok\":%s,\"card\":\"%s\",\"bus\":\"%s\",\"w\":%u,\"h\":%u}",
+        s_devnode, s_cam_ok?"true":"false", s_cam_card, s_cam_bus, (unsigned)s_cam_w, (unsigned)s_cam_h);
+    return httpd_resp_send(r, buf, n);
+}
+
+// HTTP: /kcfg — dump key Kconfig flags
+static esp_err_t kcfg_get(httpd_req_t *r){
+    httpd_resp_set_type(r, "application/json");
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"OV5647\":%s,\"MIPI_CSI\":%s,\"XCLK_ROUTER\":%s}",
+#ifdef CONFIG_CAMERA_OV5647
+        "true",
+#else
+        "false",
+#endif
+#ifdef CONFIG_ESP_VIDEO_ENABLE_MIPI_CSI_VIDEO_DEVICE
+        "true",
+#else
+        "false",
+#endif
+#ifdef CONFIG_CAMERA_XCLK_USE_ESP_CLOCK_ROUTER
+        "true"
+#else
+        "false"
+#endif
+    );
+    return httpd_resp_send(r, buf, n);
+}
+
 // Optional tiny HTTP check for camera
 static esp_err_t cam_ok_get(httpd_req_t *r){
     httpd_resp_set_type(r, "text/plain");
@@ -624,6 +754,8 @@ static httpd_handle_t start_web(void) {
     httpd_uri_t u_events  = { .uri="/events",  .method=HTTP_GET,  .handler=events_get  };
     httpd_uri_t u_dev     = { .uri="/dev",     .method=HTTP_GET,  .handler=dev_get     };
     httpd_uri_t u_i2c     = { .uri="/i2c",     .method=HTTP_GET,  .handler=i2c_get     };
+    httpd_uri_t u_probe   = { .uri="/probe",   .method=HTTP_GET,  .handler=probe_get   };
+    httpd_uri_t u_kcfg    = { .uri="/kcfg",    .method=HTTP_GET,  .handler=kcfg_get    };
     httpd_uri_t u_pad_g   = { .uri="/pad",     .method=HTTP_GET,  .handler=pad_handler };
     httpd_uri_t u_pad_p   = { .uri="/pad",     .method=HTTP_POST, .handler=pad_handler };
     TRY( httpd_register_uri_handler(h, &u_root) );
@@ -634,6 +766,8 @@ static httpd_handle_t start_web(void) {
     TRY( httpd_register_uri_handler(h, &u_cam_ok) );
     TRY( httpd_register_uri_handler(h, &u_dev) );
     TRY( httpd_register_uri_handler(h, &u_i2c) );
+    TRY( httpd_register_uri_handler(h, &u_probe) );
+    TRY( httpd_register_uri_handler(h, &u_kcfg) );
 #ifdef CONFIG_HTTPD_WS_SUPPORT
     httpd_uri_t u_ws = { .uri="/ws", .method=HTTP_GET, .handler=ws_handler, .user_ctx=NULL, .is_websocket = true };
     TRY( httpd_register_uri_handler(h, &u_ws) );
@@ -714,8 +848,18 @@ void app_main(void)
     esp_log_level_set("wifi", ESP_LOG_DEBUG);
     esp_log_level_set("esp_wifi_remote", ESP_LOG_DEBUG);
     esp_log_level_set("H_API", ESP_LOG_DEBUG);
+    // Turn up camera stack logs
+    esp_log_level_set("esp_video", ESP_LOG_DEBUG);
+    esp_log_level_set("esp_video_vfs", ESP_LOG_DEBUG);
+    esp_log_level_set("esp_cam_sensor", ESP_LOG_DEBUG);
+    esp_log_level_set("esp_driver_cam", ESP_LOG_DEBUG);
+    esp_log_level_set("cam_ctlr_mipi_csi", ESP_LOG_DEBUG);
+    esp_log_level_set("isp", ESP_LOG_DEBUG);
 
     ensure_nvs();
+    // Quick platform dump
+    esp_chip_info_t chip; esp_chip_info(&chip);
+    LOGI("Chip: model=%d cores=%d rev=%d features=0x%x", chip.model, chip.cores, chip.revision, chip.features);
     // Show key Kconfig camera/video flags at runtime
 #ifdef CONFIG_CAMERA_OV5647
     LOGI("Kconfig: CONFIG_CAMERA_OV5647 = y");
@@ -741,6 +885,10 @@ void app_main(void)
     TRY( esp_event_handler_instance_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP, ip_evt, NULL, &inst) );
 
+    // Optional: run SCCB smoke test early to see ACKs/ID
+#if CONFIG_P4_DEBUG_ENABLE_I2C_SMOKE
+    sccb_smoke_test();
+#endif
     // Try STA for ~12s, then AP fallback, but never abort app
     s_sta_got_ip = false;
     wifi_sta_start("DaeganSmells", "0123456789");

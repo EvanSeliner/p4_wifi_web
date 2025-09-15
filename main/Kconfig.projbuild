@@ -29,3 +29,18 @@ config P4_I2C_SMOKE_SPEED_HZ
 
 endmenu
 
+menu "P4 Camera GPIO (optional)"
+
+config P4_SCCB_RESET_GPIO
+    int "Camera RESET GPIO (-1 if none)"
+    default -1
+
+config P4_SCCB_PWDN_GPIO
+    int "Camera PWDN GPIO (-1 if none)"
+    default -1
+
+config P4_DEBUG_TOGGLE_RESET
+    bool "Toggle RESET/PWDN before I2C smoke"
+    default y
+
+endmenu
