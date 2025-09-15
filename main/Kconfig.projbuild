@@ -1,0 +1,46 @@
+menu "P4 Debug Options"
+
+config P4_DEBUG_ENABLE_I2C_SMOKE
+    bool "Enable I2C/SCCB smoke test"
+    default y
+    help
+        When enabled, app will scan I2C bus and attempt to read OV5647 chip ID.
+
+config P4_SCCB_PORT
+    int "I2C port for SCCB (0..2)"
+    depends on P4_DEBUG_ENABLE_I2C_SMOKE
+    range 0 2
+    default 0
+
+config P4_SCCB_SDA_GPIO
+    int "SCCB SDA GPIO"
+    depends on P4_DEBUG_ENABLE_I2C_SMOKE
+    default -1
+
+config P4_SCCB_SCL_GPIO
+    int "SCCB SCL GPIO"
+    depends on P4_DEBUG_ENABLE_I2C_SMOKE
+    default -1
+
+config P4_I2C_SMOKE_SPEED_HZ
+    int "I2C smoke test speed (Hz)"
+    depends on P4_DEBUG_ENABLE_I2C_SMOKE
+    default 100000
+
+endmenu
+
+menu "P4 Camera GPIO (optional)"
+
+config P4_SCCB_RESET_GPIO
+    int "Camera RESET GPIO (-1 if none)"
+    default -1
+
+config P4_SCCB_PWDN_GPIO
+    int "Camera PWDN GPIO (-1 if none)"
+    default -1
+
+config P4_DEBUG_TOGGLE_RESET
+    bool "Toggle RESET/PWDN before I2C smoke"
+    default y
+
+endmenu

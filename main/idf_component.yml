@@ -7,3 +7,4 @@ dependencies:
   espressif/esp_cam_sensor: "*"           # OV5647 / CSI sensor layer
   espressif/esp_h264: ">=1.1.3"           # HW encoder for ESP32-P4
   espressif/es8311: "*"                   # your audio codec
+  # espressif/esp_driver_cam is pulled transitively by esp_cam_sensor/esp_video in this setup
