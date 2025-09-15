@@ -21,6 +21,8 @@
 #include "esp_netif.h"
 #include "esp_http_server.h"
 #include "driver/gpio.h"
+// I2C for SCCB smoke test
+#include "driver/i2c.h"
 // Camera/esp_video headers (device name via esp_video_device.h)
 // Camera/esp_video probe
 #include <fcntl.h>
@@ -73,6 +75,8 @@ static bool s_sta_got_ip    = false;
 // ---- Forward declarations & globals ----
 static esp_err_t root_get(httpd_req_t *r);
 static esp_err_t status_get(httpd_req_t *r);
+static esp_err_t dev_get(httpd_req_t *r);
+static esp_err_t i2c_get(httpd_req_t *r);
 static esp_err_t latency_get(httpd_req_t *r);
 static esp_err_t events_get(httpd_req_t *r);
 static esp_err_t pad_handler(httpd_req_t *r);
@@ -387,7 +391,17 @@ static const char STATUS_JSON_FMT[] =
 "\"cam_card\":\"%s\","
 "\"cam_bus\":\"%s\","
 "\"cam_w\":%u,"
-"\"cam_h\":%u"
+"\"cam_h\":%u,"
+#ifdef CONFIG_CAMERA_OV5647
+"\"kcfg_ov5647\":true,"
+#else
+"\"kcfg_ov5647\":false,"
+#endif
+#ifdef CONFIG_ESP_VIDEO_ENABLE_MIPI_CSI_VIDEO_DEVICE
+"\"kcfg_mipi_csi\":true"
+#else
+"\"kcfg_mipi_csi\":false"
+#endif
 "}";
 
 static esp_err_t pad_handler(httpd_req_t *r) {
@@ -466,6 +480,57 @@ static esp_err_t events_get(httpd_req_t *r) {
     }
     httpd_resp_send_chunk(r, NULL, 0);
     return ESP_OK;
+}
+
+// HTTP: /i2c — returns scan + optional ID
+static esp_err_t i2c_get(httpd_req_t *r){
+#if CONFIG_P4_DEBUG_ENABLE_I2C_SMOKE
+    httpd_resp_set_type(r, "application/json");
+    char buf[768];
+    size_t off=0;
+    off += snprintf(buf+off, sizeof(buf)-off,
+        "{\"port\":%d,\"sda\":%d,\"scl\":%d,\"speed\":%d,\"scan\":[",
+        CONFIG_P4_SCCB_PORT, CONFIG_P4_SCCB_SDA_GPIO, CONFIG_P4_SCCB_SCL_GPIO, CONFIG_P4_I2C_SMOKE_SPEED_HZ);
+    bool first=true;
+    if (i2c_smoke_init()==ESP_OK){
+        for (uint8_t a=0x08; a<0x78; ++a){ if (i2c_probe_addr(a)){
+            off += snprintf(buf+off, sizeof(buf)-off, "%s\"0x%02X\"", first?"":",", a);
+            first=false;
+        }}
+        uint8_t hi=0, lo=0; bool ok=false; uint8_t addr=0;
+        uint8_t cand[2]={0x36,0x21};
+        for(int i=0;i<2;i++){ addr=cand[i]; if (i2c_probe_addr(addr) && ov5647_read_id(addr,&hi,&lo)){ ok=true; break; } }
+        off += snprintf(buf+off, sizeof(buf)-off,
+            "],\"ov5647\":{\"ok\":%s,\"addr\":%u,\"id_hi\":%u,\"id_lo\":%u}}",
+            ok?"true":"false", (unsigned)addr, (unsigned)hi, (unsigned)lo);
+    } else {
+        off += snprintf(buf+off, sizeof(buf)-off, "]}");
+    }
+    return httpd_resp_send(r, buf, off);
+#else
+    httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "P4_DEBUG_ENABLE_I2C_SMOKE disabled");
+    return ESP_OK;
+#endif
+}
+
+// HTTP: /dev — list nodes, show candidate videos
+static esp_err_t dev_get(httpd_req_t *r){
+    httpd_resp_set_type(r, "text/plain");
+    DIR *d = opendir("/dev");
+    if (!d){ return httpd_resp_sendstr(r, "opendir(/dev) failed\n"); }
+    char line[64];
+    httpd_resp_sendstr_chunk(r, "DEV LIST:\n");
+    struct dirent *e; while ((e=readdir(d))!=NULL){
+        int n = snprintf(line, sizeof(line), "  %s\n", e->d_name);
+        httpd_resp_send_chunk(r, line, n);
+    }
+    closedir(d);
+    const char* vid = find_video_node();
+    if (vid){
+        int n = snprintf(line, sizeof(line), "video: %s\n", vid);
+        httpd_resp_send_chunk(r, line, n);
+    }
+    return httpd_resp_send_chunk(r, NULL, 0);
 }
 
 // Optional tiny HTTP check for camera
@@ -557,6 +622,8 @@ static httpd_handle_t start_web(void) {
     httpd_uri_t u_latency = { .uri="/latency", .method=HTTP_GET,  .handler=latency_get };
     httpd_uri_t u_ui      = { .uri="/ui.js",  .method=HTTP_GET,  .handler=ui_get      };
     httpd_uri_t u_events  = { .uri="/events",  .method=HTTP_GET,  .handler=events_get  };
+    httpd_uri_t u_dev     = { .uri="/dev",     .method=HTTP_GET,  .handler=dev_get     };
+    httpd_uri_t u_i2c     = { .uri="/i2c",     .method=HTTP_GET,  .handler=i2c_get     };
     httpd_uri_t u_pad_g   = { .uri="/pad",     .method=HTTP_GET,  .handler=pad_handler };
     httpd_uri_t u_pad_p   = { .uri="/pad",     .method=HTTP_POST, .handler=pad_handler };
     TRY( httpd_register_uri_handler(h, &u_root) );
@@ -565,6 +632,8 @@ static httpd_handle_t start_web(void) {
     TRY( httpd_register_uri_handler(h, &u_ui) );
     TRY( httpd_register_uri_handler(h, &u_events) );
     TRY( httpd_register_uri_handler(h, &u_cam_ok) );
+    TRY( httpd_register_uri_handler(h, &u_dev) );
+    TRY( httpd_register_uri_handler(h, &u_i2c) );
 #ifdef CONFIG_HTTPD_WS_SUPPORT
     httpd_uri_t u_ws = { .uri="/ws", .method=HTTP_GET, .handler=ws_handler, .user_ctx=NULL, .is_websocket = true };
     TRY( httpd_register_uri_handler(h, &u_ws) );
