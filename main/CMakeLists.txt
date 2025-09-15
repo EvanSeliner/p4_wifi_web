@@ -18,6 +18,8 @@ idf_component_register(
         espressif__esp_video
         espressif__esp_cam_sensor
         espressif__esp_h264
+    EMBED_FILES
+        "index.html"
 )
 
 # If you really need private/public headers from managed components:
