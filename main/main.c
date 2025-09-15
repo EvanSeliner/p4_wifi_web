@@ -356,10 +356,10 @@ static void dump_dev_dir(void){
 
 static const char* find_video_node(void){
     static char path[32];
-    struct stat st;
     for (int i=0;i<4;i++){
         snprintf(path, sizeof(path), "/dev/video%d", i);
-        if (stat(path, &st) == 0) return path;
+        int fd = open(path, O_RDWR);
+        if (fd >= 0){ close(fd); return path; }
     }
     return NULL;
 }
@@ -647,6 +647,17 @@ void app_main(void)
     esp_log_level_set("H_API", ESP_LOG_DEBUG);
 
     ensure_nvs();
+    // Show key Kconfig camera/video flags at runtime
+#ifdef CONFIG_CAMERA_OV5647
+    LOGI("Kconfig: CONFIG_CAMERA_OV5647 = y");
+#else
+    LOGW("Kconfig: CONFIG_CAMERA_OV5647 = n (enable in menuconfig)");
+#endif
+#ifdef CONFIG_ESP_VIDEO_ENABLE_MIPI_CSI_VIDEO_DEVICE
+    LOGI("Kconfig: MIPI-CSI video device enabled");
+#else
+    LOGW("Kconfig: MIPI-CSI video device DISABLED");
+#endif
     TRY( esp_netif_init() );
     TRY( esp_event_loop_create_default() );
 
