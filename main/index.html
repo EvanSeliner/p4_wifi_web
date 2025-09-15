@@ -1,133 +1,228 @@
-<!DOCTYPE html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>ESP32-P4 Video + Gamepad</title>
-    <style>
-      body { font-family: system-ui, Arial; padding: 12px; max-width: 960px; margin: 0 auto; }
-      h1 { text-align: center; }
-      .container { display: flex; gap: 24px; }
-      .video-container { flex: 3; }
-      .controls-container { flex: 2; }
-      #video-player { width: 100%; background-color: #000; }
-      .btn { display:flex; gap:12px; align-items:center; padding:6px 0; }
-      .dot { width:12px; height:12px; border-radius:50%; background:#ccc; }
-      .dot.pressed { background:#0a0; }
-      .val { color:#555; font-family: monospace; }
-    </style>
-    <script src="https://cdn.jsdelivr.net/gh/mbebenita/Broadway/Player/Broadway.js"></script>
-  </head>
-  <body>
-    <h1>ESP32-P4 Video + Gamepad</h1>
-    <div class="container">
-      <div class="video-container" id="video-container">
-        <h2>Video Stream</h2>
-        <canvas id="video-player"></canvas>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ESP32-P4 · Status + Gamepad</title>
+<style>
+  :root{--bg:#0f1116;--card:#151826;--fg:#e6e8ef;--muted:#96a0b5;--ok:#2ecc71;--warn:#f1c40f;--bad:#e74c3c;--brand:#4dabf7}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:980px;margin:32px auto;padding:0 16px}
+  h1{font-size:22px;margin:0 0 16px}
+  .card{background:var(--card);border-radius:14px;padding:16px 18px;box-shadow:0 6px 20px rgba(0,0,0,.25);margin-bottom:16px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:12px}
+  .kv{padding:12px;border:1px solid #22273a;border-radius:10px}
+  .k{color:var(--muted);font-size:12px}.v{font-size:16px;margin-top:4px}
+  .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px}
+  .ok{background:#163d2b;color:var(--ok);border:1px solid #1f5c3f}
+  .bad{background:#3d1a1a;color:var(--bad);border:1px solid #6a2b2b}
+  .warn{background:#3d351a;color:var(--warn);border:1px solid #6a5e2b}
+  .brand{background:#142338;color:var(--brand);border:1px solid #1f3762}
+  pre{white-space:pre-wrap;word-break:break-word;background:#0d1018;border:1px solid #22273a;border-radius:10px;padding:10px;max-height:280px;overflow:auto}
+  a{color:var(--brand);text-decoration:none}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .padgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
+  .btn{display:inline-block;padding:6px 10px;border-radius:10px;border:1px solid #26304a;cursor:pointer}
+  .btn:active{transform:translateY(1px)}
+  .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+  .tiny{font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ESP32-P4 Web • Live Status + Gamepad</h1>
+
+  <!-- STATUS CARD -->
+  <div class="card" id="statusCard">
+    <div class="row">
+      <div id="chip" class="pill brand">P4 + C6 (ESP-Hosted)</div>
+      <div id="hostedPill" class="pill warn">hosted_ready: ?</div>
+      <div id="wifiPill" class="pill warn">wifi: ?</div>
+      <div id="ipPill" class="pill warn">ip: ?</div>
+      <div id="buildPill" class="pill">build: ?</div>
+    </div>
+
+    <div class="grid">
+      <div class="kv"><div class="k">uptime</div><div id="uptime" class="v">—</div></div>
+      <div class="kv"><div class="k">heap_free</div><div id="heap_free" class="v">—</div></div>
+      <div class="kv"><div class="k">heap_min</div><div id="heap_min" class="v">—</div></div>
+    </div>
+
+    <h3 style="margin:14px 0 8px">Raw /status JSON</h3>
+    <pre id="raw">—</pre>
+  </div>
+
+  <!-- GAMEPAD CARD -->
+  <div class="card" id="gamepadCard">
+    <div class="row">
+      <div id="gpPill" class="pill warn">gamepad: disconnected</div>
+      <div class="tiny">Press any button on your controller to grant browser access.</div>
+    </div>
+
+    <div class="padgrid">
+      <div class="kv">
+        <div class="k">id / index</div>
+        <div class="v mono" id="gpInfo">—</div>
       </div>
-      <div class="controls-container">
-        <h2>Gamepad</h2>
-        <p id="status">Waiting for gamepad…</p>
-        <div id="buttons"></div>
+      <div class="kv">
+        <div class="k">buttons pressed</div>
+        <div class="v mono" id="gpButtons">—</div>
+      </div>
+      <div class="kv">
+        <div class="k">axes</div>
+        <div class="v mono" id="gpAxes">—</div>
+      </div>
+      <div class="kv">
+        <div class="k">last POST to /pad</div>
+        <div class="v mono" id="gpPostStatus">—</div>
       </div>
     </div>
 
-    <script>
-      // --- Video WebSocket ---
-      const videoPlayer = new Player({
-        useWorker: true,
-        webgl: 'auto',
-        size: { width: 640, height: 480 }
-      });
-      document.getElementById('video-container').appendChild(videoPlayer.canvas);
+    <div style="margin-top:12px" class="tiny">
+      This page polls the Gamepad API at ~60 Hz and will <code>POST /pad</code> with a compact JSON payload.
+      If your firmware doesn’t implement <code>/pad</code> yet, the POST is ignored and no errors bubble to the UI.
+    </div>
 
-      const ws = new WebSocket(`ws://${window.location.host}/ws`);
-      ws.binaryType = 'arraybuffer';
-      ws.onmessage = (event) => {
-        // Broadway player expects a Uint8Array
-        const frame = new Uint8Array(event.data);
-        videoPlayer.decode(frame);
-      };
-      ws.onopen = () => console.log('Video WebSocket connected');
-      ws.onclose = () => console.log('Video WebSocket disconnected');
+    <div style="margin-top:10px">
+      <button class="btn" id="vibrateBtn">Vibrate (if supported)</button>
+      <button class="btn" id="zeroBtn">Zero Sticks</button>
+    </div>
+  </div>
 
-      // --- Gamepad Logic ---
-      const statusEl = document.getElementById("status");
-      const buttonsEl = document.getElementById("buttons");
+  <p class="tiny">Hard-refresh (Ctrl+F5) after flashing to bust cache.</p>
+</div>
 
-      let gpIndex = null;
-      let raf = null;
+<script>
+/* -------- STATUS POLL -------- */
+async function tickStatus() {
+  try {
+    const r = await fetch('/status', {cache:'no-store'});
+    const j = await r.json();
 
-      function ensureButtons(count) {
-        while (buttonsEl.childElementCount < count) {
-          const row = document.createElement("div");
-          row.className = "btn";
-          row.innerHTML = `
-            <div class="dot" aria-hidden></div>
-            <div>
-              <div class="label"></div>
-              <div class="val"></div>
-            </div>
-          `;
-          buttonsEl.appendChild(row);
-        }
-        while (buttonsEl.childElementCount > count) {
-          buttonsEl.removeChild(buttonsEl.lastChild);
-        }
-      }
+    const hosted = document.getElementById('hostedPill');
+    hosted.textContent = `hosted_ready: ${j.hosted_ready}`;
+    hosted.className = `pill ${j.hosted_ready ? 'ok' : 'bad'}`;
 
-      function renderButtons(buttons) {
-        ensureButtons(buttons.length);
-        for (let i = 0; i < buttons.length; i++) {
-          const b = buttons[i];
-          const row = buttonsEl.children[i];
-          const dot = row.querySelector(".dot");
-          const label = row.querySelector(".label");
-          const val = row.querySelector(".val");
+    const wifi = document.getElementById('wifiPill');
+    wifi.textContent = `wifi: ${j.wifi_mode}${j.sta_got_ip?' (got_ip)':''}`;
+    wifi.className = `pill ${j.sta_got_ip ? 'ok' : (j.wifi_mode==='AP'?'warn':'bad')}`;
 
-          if (b.pressed) dot.classList.add("pressed");
-          else dot.classList.remove("pressed");
+    const ip = document.getElementById('ipPill');
+    ip.textContent = j.ip || 'ip: n/a';
 
-          label.textContent = `Button ${i}`;
-          val.textContent = `pressed: ${b.pressed}  value: ${Number(b.value).toFixed(3)}`;
-        }
-      }
+    const build = document.getElementById('buildPill');
+    build.textContent = `build: ${j.build||'—'}`;
 
-      function poll() {
-        const gps = navigator.getGamepads ? navigator.getGamepads() : [];
-        const g = (gpIndex != null) ? gps[gpIndex] : null;
+    document.getElementById('uptime').textContent = j.uptime_s + ' s';
+    document.getElementById('heap_free').textContent = j.heap_free;
+    document.getElementById('heap_min').textContent = j.heap_min;
 
-        if (g) {
-          statusEl.textContent = `Gamepad: ${g.id} (index ${g.index})`;
-          renderButtons(g.buttons);
-        } else {
-          statusEl.textContent = "No gamepad connected";
-          buttonsEl.innerHTML = "";
-        }
+    document.getElementById('raw').textContent = JSON.stringify(j, null, 2);
+  } catch(e) {
+    document.getElementById('raw').textContent = 'Error fetching /status: ' + e;
+    document.getElementById('hostedPill').className = 'pill warn';
+    document.getElementById('wifiPill').className = 'pill warn';
+  } finally {
+    setTimeout(tickStatus, 1000);
+  }
+}
+tickStatus();
 
-        raf = requestAnimationFrame(poll);
-      }
+/* -------- GAMEPAD -------- */
+let lastPostTs = 0;
+let zero = {x0:0, y0:0, x1:0, y1:0};  // software dead-zone center
+const DEAD = 0.08;                     // deadzone
 
-      window.addEventListener("gamepadconnected", (e) => {
-        gpIndex = e.gamepad.index;
-        console.log("connected", e.gamepad);
-        if (raf == null) poll();
-      });
+function getPrimaryPad() {
+  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+  for (let i=0;i<pads.length;i++) if (pads[i]) return pads[i];
+  return null;
+}
 
-      window.addEventListener("gamepaddisconnected", (e) => {
-        if (gpIndex === e.gamepad.index) gpIndex = null;
-        console.log("disconnected", e.gamepad);
-      });
+function dz(v) { return Math.abs(v) < DEAD ? 0 : v; }
+function q2(v) { return Math.round(v*100)/100; } // 2 decimals
 
-      window.addEventListener("load", () => {
-        const gps = navigator.getGamepads ? navigator.getGamepads() : [];
-        for (let i = 0; i < gps.length; i++) {
-          if (gps[i]) {
-            gpIndex = gps[i].index;
-            break;
-          }
-        }
-        poll();
-      });
-    </script>
-  </body>
+async function postPad(payload) {
+  try {
+    const res = await fetch('/pad', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const ok = res.ok ? `ok ${res.status}` : `http ${res.status}`;
+    document.getElementById('gpPostStatus').textContent = `${ok} @ ${new Date().toLocaleTimeString()}`;
+  } catch(e) {
+    // Silently ignore so UI never looks "broken" if /pad isn't implemented
+    document.getElementById('gpPostStatus').textContent = `POST skipped (${e})`;
+  }
+}
+
+function pollGamepad() {
+  const gp = getPrimaryPad();
+  const pill = document.getElementById('gpPill');
+  const info = document.getElementById('gpInfo');
+  const btns = document.getElementById('gpButtons');
+  const axes = document.getElementById('gpAxes');
+
+  if (!gp) {
+    pill.textContent = 'gamepad: disconnected';
+    pill.className = 'pill warn';
+    info.textContent = '—';
+    btns.textContent = '—';
+    axes.textContent = '—';
+    requestAnimationFrame(pollGamepad);
+    return;
+  }
+
+  pill.textContent = `gamepad: ${gp.id || 'unknown'}`;
+  pill.className = 'pill ok';
+  info.textContent = `${gp.id || 'gamepad'}  |  index ${gp.index}`;
+
+  // Build compact state
+  const b = gp.buttons.map((b,i)=>b.pressed?i:null).filter(i=>i!==null);     // pressed indices
+  const ax = gp.axes.map(v=>q2(dz(v)));                                       // quantized axes
+
+  btns.textContent = b.length ? b.join(', ') : 'none';
+  axes.textContent = ax.join(', ');
+
+  // Throttle posts to ~60 Hz max (here: every frame if connected)
+  const now = performance.now();
+  if (now - lastPostTs > 16) {  // ~60fps
+    lastPostTs = now;
+    postPad({
+      t: Date.now(),
+      idx: gp.index,
+      b,              // pressed button indices
+      ax,             // axes array
+      // normalized sticks with software center offsets (for convenience)
+      lx: q2(dz(gp.axes[0] - zero.x0)), ly: q2(dz(gp.axes[1] - zero.y0)),
+      rx: q2(dz(gp.axes[2] - zero.x1)), ry: q2(dz(gp.axes[3] - zero.y1))
+    });
+  }
+
+  requestAnimationFrame(pollGamepad);
+}
+
+// events help some browsers start delivering pads
+window.addEventListener('gamepadconnected', ()=>pollGamepad());
+window.addEventListener('gamepaddisconnected', ()=>pollGamepad());
+// Kick it once in case the browser already has a pad
+requestAnimationFrame(pollGamepad);
+
+/* UI buttons */
+document.getElementById('vibrateBtn').addEventListener('click',()=>{
+  const gp = getPrimaryPad();
+  const act = gp && gp.vibrationActuator;
+  if (act && act.type === 'dual-rumble') {
+    act.playEffect('dual-rumble',{duration:200,strongMagnitude:1.0,weakMagnitude:0.6});
+  }
+});
+document.getElementById('zeroBtn').addEventListener('click',()=>{
+  const gp = getPrimaryPad();
+  if (gp) {
+    zero.x0 = gp.axes[0]||0; zero.y0 = gp.axes[1]||0;
+    zero.x1 = gp.axes[2]||0; zero.y1 = gp.axes[3]||0;
+  }
+});
+</script>
+</body>
 </html>
