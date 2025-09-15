@@ -25,6 +25,8 @@
 // Camera/esp_video probe
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include "linux/videodev2.h"
 #include "esp_video_device.h"
 #include <unistd.h>
@@ -342,6 +344,26 @@ static char     s_cam_card[32] = {0};
 static char     s_cam_bus[32]  = {0};
 static uint16_t s_cam_w = 0, s_cam_h = 0;
 
+// Helper: list /dev and locate a /dev/videoX node
+static void dump_dev_dir(void){
+    DIR *d = opendir("/dev");
+    if (!d) { LOGW("opendir(/dev) failed"); return; }
+    struct dirent *e;
+    LOGI("/dev contents:");
+    while ((e = readdir(d)) != NULL) LOGI("  %s", e->d_name);
+    closedir(d);
+}
+
+static const char* find_video_node(void){
+    static char path[32];
+    struct stat st;
+    for (int i=0;i<4;i++){
+        snprintf(path, sizeof(path), "/dev/video%d", i);
+        if (stat(path, &st) == 0) return path;
+    }
+    return NULL;
+}
+
 // Safer JSON format strings (avoid heavy escaping in snprintf lines)
 static const char PAD_JSON_FMT[] =
 "{"
@@ -455,7 +477,19 @@ static esp_err_t cam_ok_get(httpd_req_t *r){
 
 // One-shot camera probe using V4L2 QUERYCAP via esp_video VFS device
 static void cam_probe_once(void) {
-    const char *dev = ESP_VIDEO_MIPI_CSI_DEVICE_NAME; // e.g. "/dev/video0"
+    // Give the driver a brief moment to register VFS device
+    const char *dev = NULL;
+    for (int tries=0; tries<20 && !dev; ++tries){
+        dev = find_video_node();
+        if (!dev) vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    dump_dev_dir();
+    if (!dev){
+        LOGE("camera: no /dev/video* found (sensor not registered)");
+        s_cam_ok = false;
+        return;
+    }
+    LOGI("camera: opening %s", dev);
     int fd = open(dev, O_RDWR);
     if (fd < 0) {
         LOGE("camera: open(%s) failed", dev);
