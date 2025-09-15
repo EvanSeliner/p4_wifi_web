@@ -21,6 +21,7 @@
 #include "esp_netif.h"
 #include "esp_http_server.h"
 #include "driver/gpio.h"
+// Camera/esp_video headers (device name via esp_video_device.h)
 // Camera/esp_video probe
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -508,6 +509,8 @@ static esp_err_t ws_handler(httpd_req_t *req);
 static httpd_handle_t start_web(void) {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = 80;
+    cfg.max_uri_handlers = 16;      // avoid ESP_ERR_HTTPD_HANDLERS_FULL
+    cfg.lru_purge_enable = true;    // purge old handlers if needed
     httpd_handle_t h = NULL;
     esp_err_t e = httpd_start(&h, &cfg);
     if (e != ESP_OK) {
@@ -636,6 +639,10 @@ void app_main(void)
     // HTTP always attempts to start
     start_web();
     // Probe the CSI camera once and report status in logs and /status
+    // Increase esp_video logs for troubleshooting (device registration, probe)
+    esp_log_level_set("esp_video", ESP_LOG_DEBUG);
+    esp_log_level_set("esp_video_vfs", ESP_LOG_DEBUG);
+    esp_log_level_set("esp_cam_sensor", ESP_LOG_DEBUG);
     cam_probe_once();
     LOGW("Browse http://<ip>/status (JSON) and http://<ip>/latency for the gamepad RTT demo");
 }
