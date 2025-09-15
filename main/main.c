@@ -21,6 +21,12 @@
 #include "esp_netif.h"
 #include "esp_http_server.h"
 #include "driver/gpio.h"
+// Camera/esp_video probe
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include "linux/videodev2.h"
+#include "esp_video_device.h"
+#include <unistd.h>
 // (build string via esp_get_idf_version())
 
 // WiFi via Hosted/Remote (forwards esp_wifi_* to C6 over SDIO)
@@ -261,6 +267,8 @@ static esp_err_t ui_get(httpd_req_t *r){
     return httpd_resp_send(r, k_ui_js, HTTPD_RESP_USE_STRLEN);
 }
 
+// (camera probe defined later, after globals)
+
 static esp_err_t root_get(httpd_req_t *r) {
     // Serve the embedded index.html, then append our latency UI script so it
     // appears on the main page without modifying your original HTML blob.
@@ -327,6 +335,11 @@ static esp_err_t latency_get(httpd_req_t *r) {
 // Minimal /pad sink (prevents 404 spam). Accepts POST/GET, returns 204.
 static volatile uint32_t g_pad_count = 0;
 static volatile uint64_t g_pad_last_us = 0;
+// Camera probe state
+static bool     s_cam_ok = false;
+static char     s_cam_card[32] = {0};
+static char     s_cam_bus[32]  = {0};
+static uint16_t s_cam_w = 0, s_cam_h = 0;
 
 // Safer JSON format strings (avoid heavy escaping in snprintf lines)
 static const char PAD_JSON_FMT[] =
@@ -346,7 +359,12 @@ static const char STATUS_JSON_FMT[] =
 "\"sta_got_ip\":%s,"
 "\"build\":\"%s\","
 "\"pad_count\":%" PRIu32 ","
-"\"pad_last_us\":%" PRIu64
+"\"pad_last_us\":%" PRIu64 ","
+"\"cam_ok\":%s,"
+"\"cam_card\":\"%s\","
+"\"cam_bus\":\"%s\","
+"\"cam_w\":%u,"
+"\"cam_h\":%u"
 "}";
 
 static esp_err_t pad_handler(httpd_req_t *r) {
@@ -378,13 +396,17 @@ static esp_err_t status_get(httpd_req_t *r) {
     uint32_t heap_f = esp_get_free_heap_size();
     uint32_t heap_m = esp_get_minimum_free_heap_size();
 
-    char out[360];
-int n = snprintf(out, sizeof(out), STATUS_JSON_FMT,
+    char out[480];
+    int n = snprintf(out, sizeof(out), STATUS_JSON_FMT,
         up_s, heap_f, heap_m,
         s_hosted_ready ? "true" : "false",
         s_sta_got_ip   ? "true" : "false",
         build,
-        g_pad_count, (uint64_t)g_pad_last_us);
+        g_pad_count, (uint64_t)g_pad_last_us,
+        s_cam_ok ? "true" : "false",
+        s_cam_card[0] ? s_cam_card : "",
+        s_cam_bus[0]  ? s_cam_bus  : "",
+        (unsigned)s_cam_w, (unsigned)s_cam_h);
 
     if (n < 0) {
         httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "snprintf failed");
@@ -423,6 +445,60 @@ static esp_err_t events_get(httpd_req_t *r) {
     return ESP_OK;
 }
 
+// Optional tiny HTTP check for camera
+static esp_err_t cam_ok_get(httpd_req_t *r){
+    httpd_resp_set_type(r, "text/plain");
+    if (s_cam_ok) return httpd_resp_sendstr(r, "CAM=OK\n");
+    return httpd_resp_sendstr(r, "CAM=FAIL\n");
+}
+
+// One-shot camera probe using V4L2 QUERYCAP via esp_video VFS device
+static void cam_probe_once(void) {
+    const char *dev = ESP_VIDEO_MIPI_CSI_DEVICE_NAME; // e.g. "/dev/video0"
+    int fd = open(dev, O_RDWR);
+    if (fd < 0) {
+        LOGE("camera: open(%s) failed", dev);
+        s_cam_ok = false;
+        return;
+    }
+
+    struct v4l2_capability cap = {0};
+    if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) {
+        snprintf(s_cam_card, sizeof(s_cam_card), "%s", (const char*)cap.card);
+        snprintf(s_cam_bus,  sizeof(s_cam_bus),  "%s", (const char*)cap.bus_info);
+        s_cam_ok = true;
+        LOGI("camera: QUERYCAP ok | driver=%s card=%s bus=%s", cap.driver, cap.card, cap.bus_info);
+    } else {
+        LOGE("camera: VIDIOC_QUERYCAP failed");
+        s_cam_ok = false;
+        close(fd);
+        LOGE("CAMERA PROBE: FAIL (check ribbon + I2C pins)");
+        return;
+    }
+
+    struct v4l2_format fmt = {0};
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width  = 640;
+    fmt.fmt.pix.height = 480;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_RGB565;
+    fmt.fmt.pix.field = V4L2_FIELD_NONE;
+    if (ioctl(fd, VIDIOC_S_FMT, &fmt) == 0) {
+        s_cam_w = fmt.fmt.pix.width;
+        s_cam_h = fmt.fmt.pix.height;
+        LOGI("camera: S_FMT ok -> %ux%u fourcc=0x%08x", s_cam_w, s_cam_h, fmt.fmt.pix.pixelformat);
+    } else {
+        LOGW("camera: S_FMT not applied (continuing)");
+    }
+
+    close(fd);
+    if (s_cam_ok) {
+        LOGI("CAMERA PROBE: PASS (OV5647 expected) card=%s bus=%s %ux%u",
+             s_cam_card[0]?s_cam_card:"?", s_cam_bus[0]?s_cam_bus:"?", s_cam_w, s_cam_h);
+    } else {
+        LOGE("CAMERA PROBE: FAIL (check ribbon + I2C pins)");
+    }
+}
+
 
 #ifdef CONFIG_HTTPD_WS_SUPPORT
 // Forward declaration so start_web() can reference ws_handler
@@ -440,6 +516,7 @@ static httpd_handle_t start_web(void) {
     }
     httpd_uri_t u_root    = { .uri="/",        .method=HTTP_GET,  .handler=root_get    };
     httpd_uri_t u_status  = { .uri="/status",  .method=HTTP_GET,  .handler=status_get  };
+    httpd_uri_t u_cam_ok  = { .uri="/cam",     .method=HTTP_GET,  .handler=cam_ok_get  };
     httpd_uri_t u_latency = { .uri="/latency", .method=HTTP_GET,  .handler=latency_get };
     httpd_uri_t u_ui      = { .uri="/ui.js",  .method=HTTP_GET,  .handler=ui_get      };
     httpd_uri_t u_events  = { .uri="/events",  .method=HTTP_GET,  .handler=events_get  };
@@ -450,6 +527,7 @@ static httpd_handle_t start_web(void) {
     TRY( httpd_register_uri_handler(h, &u_latency) );
     TRY( httpd_register_uri_handler(h, &u_ui) );
     TRY( httpd_register_uri_handler(h, &u_events) );
+    TRY( httpd_register_uri_handler(h, &u_cam_ok) );
 #ifdef CONFIG_HTTPD_WS_SUPPORT
     httpd_uri_t u_ws = { .uri="/ws", .method=HTTP_GET, .handler=ws_handler, .user_ctx=NULL, .is_websocket = true };
     TRY( httpd_register_uri_handler(h, &u_ws) );
@@ -557,5 +635,7 @@ void app_main(void)
 
     // HTTP always attempts to start
     start_web();
+    // Probe the CSI camera once and report status in logs and /status
+    cam_probe_once();
     LOGW("Browse http://<ip>/status (JSON) and http://<ip>/latency for the gamepad RTT demo");
 }
