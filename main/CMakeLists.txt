@@ -12,12 +12,14 @@ idf_component_register(
         nvs_flash
         esp_timer
         esp_http_server
+        esp_psram
         driver
         esp_wifi
         espressif__esp_wifi_remote
         espressif__esp_video
         espressif__esp_cam_sensor
         espressif__esp_h264
+        mbedtls
     EMBED_FILES
         "index.html"
 )

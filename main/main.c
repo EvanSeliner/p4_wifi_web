@@ -258,6 +258,10 @@ static void stun_task(void *arg){
         uint32_t crc = crc32_update(0, out, fp_pos+4); crc ^= 0x5354554e; wr32(out+fp_pos+4, crc);
         // Send
         sendto(s->sock, out, off, 0, (struct sockaddr*)&from, sizeof(from));
+        uint32_t a = ntohl(from.sin_addr.s_addr);
+        LOGI("STUN: success -> %u.%u.%u.%u:%u",
+             (unsigned)((a>>24)&255),(unsigned)((a>>16)&255),
+             (unsigned)((a>>8)&255),(unsigned)(a&255), (unsigned)ntohs(from.sin_port));
         s->peer_addr = from; s->have_peer = true; s->ice_connected = true;
     }
 }
