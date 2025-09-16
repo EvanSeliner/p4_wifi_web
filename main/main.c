@@ -211,11 +211,16 @@ static void stun_task(void *arg){
         const char *colon = memchr(uval, ':', ulen);
         if (!colon) { LOGW("STUN: USERNAME missing colon"); continue; }
         size_t lleft = (size_t)(colon - (const char*)uval);
-        size_t lright = (size_t)ulen - lleft - 1;
+        (void)lleft; // only used for logging if needed
         char uname[128]; size_t ul = ulen < sizeof(uname)-1 ? ulen : sizeof(uname)-1; memcpy(uname, uval, ul); uname[ul] = '\0';
         char ex1[128]; char ex2[128];
-        snprintf(ex1, sizeof(ex1), "%s:%s", s->local_ufrag, s->remote_ufrag);
-        snprintf(ex2, sizeof(ex2), "%s:%s", s->remote_ufrag, s->local_ufrag);
+        // Build ex1 = local:remote safely
+        size_t ll = strlen(s->local_ufrag); size_t lr = strlen(s->remote_ufrag);
+        if (ll + 1 + lr >= sizeof(ex1)) { LOGW("STUN: expected USERNAME too long (local+remote)"); continue; }
+        memcpy(ex1, s->local_ufrag, ll); ex1[ll] = ':'; memcpy(ex1+ll+1, s->remote_ufrag, lr); ex1[ll+1+lr] = '\0';
+        // Build ex2 = remote:local safely
+        if (lr + 1 + ll >= sizeof(ex2)) { LOGW("STUN: expected USERNAME too long (remote+local)"); continue; }
+        memcpy(ex2, s->remote_ufrag, lr); ex2[lr] = ':'; memcpy(ex2+lr+1, s->local_ufrag, ll); ex2[lr+1+ll] = '\0';
         if (strcmp(uname, ex1) != 0 && strcmp(uname, ex2) != 0) {
             LOGW("STUN: USERNAME mismatch got='%s' ex1='%s' ex2='%s'", uname, ex1, ex2);
             continue;
