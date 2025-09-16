@@ -247,15 +247,21 @@ static void stun_task(void *arg){
         // Verify MESSAGE-INTEGRITY (HMAC-SHA1 with remote ice-pwd)
         const uint8_t *mival=NULL; uint16_t milen=0; size_t mioff=0;
         if (!parse_attr_find(buf, n, 0x0008, &mival, &milen, &mioff) || milen != 20) { if (stun_warn_budget-->0) LOGW("STUN: no MESSAGE-INTEGRITY"); continue; }
-        // Compute HMAC over message up to (but excluding) MI value
+        // Verify MESSAGE-INTEGRITY per RFC5389:
+        // - Set STUN header length to cover up to and including the MI attribute value (20 bytes)
+        // - Compute HMAC-SHA1 over message up to end of MI value, with MI value bytes set to 0
         uint8_t calc[20];
-        uint8_t tmp[2] = { (uint8_t)((mioff-20)>>8), (uint8_t)((mioff-20)&0xFF) };
-        // Temporarily set message length to cover attrs up to MI header (excluding its 20B value)
         uint8_t saved_len[2] = { buf[2], buf[3] };
-        buf[2] = tmp[0]; buf[3] = tmp[1];
-        if (!hmac_sha1((const uint8_t*)s->remote_pwd, strlen(s->remote_pwd), buf, mioff+4, calc)) { buf[2]=saved_len[0]; buf[3]=saved_len[1]; LOGW("STUN: HMAC compute failed"); continue; }
+        uint8_t tmp_len[2] = { (uint8_t)(((mioff - 20) + 24) >> 8), (uint8_t)(((mioff - 20) + 24) & 0xFF) };
+        buf[2] = tmp_len[0]; buf[3] = tmp_len[1];
+        // Make a temporary copy up to end of MI value and zero the 20-byte MI value
+        size_t mi_total = mioff + 4 + 20; if (mi_total > (size_t)n) mi_total = (size_t)n;
+        uint8_t tbuf[600]; size_t tlen = mi_total < sizeof(tbuf) ? mi_total : sizeof(tbuf);
+        memcpy(tbuf, buf, tlen);
+        if (mioff + 4 + 20 <= tlen) memset(tbuf + mioff + 4, 0, 20);
+        bool ok_h = hmac_sha1((const uint8_t*)s->remote_pwd, strlen(s->remote_pwd), tbuf, tlen, calc);
         buf[2]=saved_len[0]; buf[3]=saved_len[1];
-        if (memcmp(calc, mival, 20) != 0) { LOGW("STUN: MESSAGE-INTEGRITY mismatch"); continue; }
+        if (!ok_h || memcmp(calc, mival, 20) != 0) { if (stun_warn_budget-->0) LOGW("STUN: MESSAGE-INTEGRITY mismatch"); continue; }
 
         // Build Binding Success Response
         uint8_t out[256]; memset(out, 0, sizeof(out));
@@ -278,11 +284,14 @@ static void stun_task(void *arg){
         // Now write header with correct length
         wr32(out+4, 0x2112A442); memcpy(out+8, buf+8, 12); // copy transaction ID
         wr16(out+2, (uint16_t)(off - 20));
-        // Compute MI over message up to (but excluding) MI value
+        // Compute MI over message up to and including MI value (value set to zero for HMAC)
         uint8_t mic[20]; uint8_t out_saved_len[2] = { out[2], out[3] };
-        uint16_t mi_len_for_hmac = (uint16_t)(mi_pos - 20 + 4); // include type+len of MI
+        uint16_t mi_len_for_hmac = (uint16_t)((mi_pos - 20) + 24); // include MI type+len+value
         out[2] = (uint8_t)(mi_len_for_hmac >> 8); out[3] = (uint8_t)(mi_len_for_hmac & 0xFF);
-        if (!hmac_sha1((const uint8_t*)s->remote_pwd, strlen(s->remote_pwd), out, mi_pos+4, mic)) { continue; }
+        uint8_t t2[600]; size_t t2len = (mi_pos + 4 + 20) < sizeof(t2) ? (mi_pos + 4 + 20) : sizeof(t2);
+        memcpy(t2, out, t2len);
+        if (mi_pos + 4 + 20 <= t2len) memset(t2 + mi_pos + 4, 0, 20);
+        if (!hmac_sha1((const uint8_t*)s->remote_pwd, strlen(s->remote_pwd), t2, t2len, mic)) { out[2]=out_saved_len[0]; out[3]=out_saved_len[1]; continue; }
         memcpy(out+mi_pos+4, mic, 20);
         out[2] = out_saved_len[0]; out[3] = out_saved_len[1];
         // Compute FINGERPRINT over whole message up to FP attr value
