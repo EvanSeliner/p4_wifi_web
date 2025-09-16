@@ -202,32 +202,32 @@ static void stun_task(void *arg){
         if (n <= 0) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
         if (n < 20) continue;
         uint16_t mtype = rd16(buf+0); uint16_t mlen = rd16(buf+2); uint32_t cookie = (buf[4]<<24)|(buf[5]<<16)|(buf[6]<<8)|buf[7];
-        if (cookie != 0x2112A442) continue; // not STUN
-        if (mtype != 0x0001) continue;      // not Binding Request
+        if (cookie != 0x2112A442) { continue; } // not STUN
+        if (mtype != 0x0001) { LOGW("STUN: non-binding msg type=0x%04x", mtype); continue; }
 
         // Verify USERNAME is remoteUF:localUF
         const uint8_t *uval=NULL; uint16_t ulen=0; size_t uoff=0;
-        if (!parse_attr_find(buf, n, 0x0006, &uval, &ulen, &uoff)) continue;
+        if (!parse_attr_find(buf, n, 0x0006, &uval, &ulen, &uoff)) { LOGW("STUN: no USERNAME"); continue; }
         const char *colon = memchr(uval, ':', ulen);
-        if (!colon) continue;
+        if (!colon) { LOGW("STUN: USERNAME missing colon"); continue; }
         size_t lrem = (size_t)(colon - (const char*)uval);
         size_t lloc = (size_t)ulen - lrem - 1;
-        if (lrem >= sizeof(s->remote_ufrag) || lloc >= sizeof(s->local_ufrag)) continue;
-        if (strncmp((const char*)uval, s->remote_ufrag, lrem) != 0) continue;
-        if (strncmp(colon+1, s->local_ufrag, lloc) != 0) continue;
+        if (lrem >= sizeof(s->remote_ufrag) || lloc >= sizeof(s->local_ufrag)) { LOGW("STUN: USERNAME length mismatch"); continue; }
+        if (strncmp((const char*)uval, s->remote_ufrag, lrem) != 0) { LOGW("STUN: ufrag(remote) mismatch"); continue; }
+        if (strncmp(colon+1, s->local_ufrag, lloc) != 0) { LOGW("STUN: ufrag(local) mismatch"); continue; }
 
         // Verify MESSAGE-INTEGRITY (HMAC-SHA1 with remote ice-pwd)
         const uint8_t *mival=NULL; uint16_t milen=0; size_t mioff=0;
-        if (!parse_attr_find(buf, n, 0x0008, &mival, &milen, &mioff) || milen != 20) continue;
+        if (!parse_attr_find(buf, n, 0x0008, &mival, &milen, &mioff) || milen != 20) { LOGW("STUN: no MESSAGE-INTEGRITY"); continue; }
         // Compute HMAC over message up to (but excluding) MI value
         uint8_t calc[20];
         uint8_t tmp[2] = { (uint8_t)((mioff-20)>>8), (uint8_t)((mioff-20)&0xFF) };
         // Temporarily set message length to cover attrs up to MI header (excluding its 20B value)
         uint8_t saved_len[2] = { buf[2], buf[3] };
         buf[2] = tmp[0]; buf[3] = tmp[1];
-        if (!hmac_sha1((const uint8_t*)s->remote_pwd, strlen(s->remote_pwd), buf, mioff+4, calc)) { buf[2]=saved_len[0]; buf[3]=saved_len[1]; continue; }
+        if (!hmac_sha1((const uint8_t*)s->remote_pwd, strlen(s->remote_pwd), buf, mioff+4, calc)) { buf[2]=saved_len[0]; buf[3]=saved_len[1]; LOGW("STUN: HMAC compute failed"); continue; }
         buf[2]=saved_len[0]; buf[3]=saved_len[1];
-        if (memcmp(calc, mival, 20) != 0) continue;
+        if (memcmp(calc, mival, 20) != 0) { LOGW("STUN: MESSAGE-INTEGRITY mismatch"); continue; }
 
         // Build Binding Success Response
         uint8_t out[256]; memset(out, 0, sizeof(out));
