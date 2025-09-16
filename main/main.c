@@ -217,31 +217,16 @@ static void stun_task(void *arg){
         if (!colon) { if (stun_warn_budget-->0) LOGW("STUN: USERNAME missing colon"); continue; }
         size_t lleft = (size_t)(colon - (const char*)uval);
         (void)lleft; // only used for logging if needed
+        // Create a bounded copy for safe logging (never use raw USERNAME as format string)
         char uname[128]; size_t ul = ulen < sizeof(uname)-1 ? ulen : sizeof(uname)-1; memcpy(uname, uval, ul); uname[ul] = '\0';
-        char ex1[128]; char ex2[128];
-        // Build ex1 = local:remote safely
+        char ex1[128];
+        // Build expected USERNAME = remote:local (browser controlling; RFC 8445)
         size_t ll = strlen(s->local_ufrag); size_t lr = strlen(s->remote_ufrag);
-        if (ll + 1 + lr >= sizeof(ex1)) { if (stun_warn_budget-->0) LOGW("STUN: expected USERNAME too long (local+remote)"); continue; }
-        memcpy(ex1, s->local_ufrag, ll); ex1[ll] = ':'; memcpy(ex1+ll+1, s->remote_ufrag, lr); ex1[ll+1+lr] = '\0';
-        // Build ex2 = remote:local safely
-        if (lr + 1 + ll >= sizeof(ex2)) { if (stun_warn_budget-->0) LOGW("STUN: expected USERNAME too long (remote+local)"); continue; }
-        memcpy(ex2, s->remote_ufrag, lr); ex2[lr] = ':'; memcpy(ex2+lr+1, s->local_ufrag, ll); ex2[lr+1+ll] = '\0';
-        if (strcmp(uname, ex1) != 0 && strcmp(uname, ex2) != 0) {
-            // As a fallback during bring-up, accept prefix match of local ufrag (some peers truncate on retries)
-            bool accept = false;
-            size_t uname_len = strlen(uname);
-            const char *sep = strchr(uname, ':');
-            if (sep) {
-                size_t lpart = (size_t)(sep - uname);
-                size_t rpart = uname_len - lpart - 1;
-                if (rpart == lr && memcmp(sep+1, s->remote_ufrag, lr) == 0 && lpart <= ll && memcmp(uname, s->local_ufrag, lpart) == 0) {
-                    accept = true; if (stun_warn_budget-->0) LOGW("STUN: accepting USERNAME prefix match '%s'", uname);
-                }
-            }
-            if (!accept) {
-                if (stun_warn_budget-->0) LOGW("STUN: USERNAME mismatch got='%s' ex1='%s' ex2='%s'", uname, ex1, ex2);
-                continue;
-            }
+        if (lr + 1 + ll >= sizeof(ex1)) { if (stun_warn_budget-->0) LOGW("STUN: expected USERNAME too long (remote+local)"); continue; }
+        memcpy(ex1, s->remote_ufrag, lr); ex1[lr] = ':'; memcpy(ex1+lr+1, s->local_ufrag, ll); ex1[lr+1+ll] = '\0';
+        if (strcmp(uname, ex1) != 0) {
+            if (stun_warn_budget-->0) LOGW("STUN: USERNAME mismatch got='%s' expect='%s'", uname, ex1);
+            continue;
         }
 
         // Verify MESSAGE-INTEGRITY (HMAC-SHA1 with remote ice-pwd)
@@ -1007,7 +992,8 @@ static esp_err_t webrtc_offer_post(httpd_req_t *r)
                 if (bind(sock, (struct sockaddr*)&sa, sizeof(sa)) == 0){ g_sess.local_port = base+i; bound=1; break; }
             }
             // Launch STUN responder task
-            xTaskCreatePinnedToCore(stun_task, "stun", 4096, NULL, 5, NULL, tskNO_AFFINITY);
+            // Give STUN task ample stack; it builds small temp buffers and logs
+            xTaskCreatePinnedToCore(stun_task, "stun", 12288, NULL, 6, NULL, tskNO_AFFINITY);
         }
     }
     uint16_t rtp_port = g_sess.local_port ? g_sess.local_port : 52000;
