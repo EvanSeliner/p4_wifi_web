@@ -30,8 +30,50 @@
 #include <sys/ioctl.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include "linux/videodev2.h"
 #include "esp_video_device.h"
+#include "esp_video_init.h"
+// H.264 HW encoder (ESP32-P4)
+#include "esp_h264_enc_single_hw.h"
+#include "esp_h264_alloc.h"
+#include "esp_heap_caps.h"
+#ifdef CONFIG_SPIRAM
+#include "esp_psram.h"
+#endif
+
+#ifndef MAP_FAILED
+#define MAP_FAILED ((void*)-1)
+#endif
+
+static void log_ram(void){
+    size_t i_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024;
+    size_t i_min  = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024;
+    size_t x_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024;
+    size_t x_size = 0;
+#ifdef CONFIG_SPIRAM
+    x_size = esp_psram_get_size() / 1024;
+#endif
+    ESP_LOGI("RAM", "int_free=%u KB psram_size=%u KB psram_free=%u KB",
+             (unsigned)i_free, (unsigned)x_size, (unsigned)x_free);
+}
+
+// Fallback SCCB defaults for esp_video_init when project Kconfig is not set
+#ifndef CONFIG_P4_SCCB_PORT
+#define CONFIG_P4_SCCB_PORT 0
+#endif
+#ifndef CONFIG_P4_SCCB_SDA_GPIO
+#define CONFIG_P4_SCCB_SDA_GPIO 7
+#endif
+#ifndef CONFIG_P4_SCCB_SCL_GPIO
+#define CONFIG_P4_SCCB_SCL_GPIO 8
+#endif
+#ifndef CONFIG_P4_SCCB_RESET_GPIO
+#define CONFIG_P4_SCCB_RESET_GPIO -1
+#endif
+#ifndef CONFIG_P4_SCCB_PWDN_GPIO
+#define CONFIG_P4_SCCB_PWDN_GPIO -1
+#endif
 #include <unistd.h>
 // (build string via esp_get_idf_version())
 
@@ -81,15 +123,68 @@ static esp_err_t i2c_get(httpd_req_t *r);
 static esp_err_t latency_get(httpd_req_t *r);
 static esp_err_t events_get(httpd_req_t *r);
 static esp_err_t pad_handler(httpd_req_t *r);
+static esp_err_t h264_stats_get(httpd_req_t *r);
 #ifdef CONFIG_HTTPD_WS_SUPPORT
 static esp_err_t ws_handler(httpd_req_t *req);
 #endif
 static void video_task(void *arg);
+static void h264_task(void *arg);
+static void video_stack_init(void);
 
 static httpd_handle_t g_httpd = NULL;
 #ifdef CONFIG_HTTPD_WS_SUPPORT
 static int s_ws_fd = -1;
 #endif
+
+// ---------------------- H.264 encode stats ----------------------
+static volatile uint32_t g_h264_frames = 0;
+static volatile uint32_t g_h264_bytes  = 0;
+static volatile bool     g_h264_running = false;
+
+static esp_err_t h264_stats_get(httpd_req_t *r){
+    char buf[96];
+    int n = snprintf(buf, sizeof(buf), "{\"running\":%s,\"frames\":%u,\"bytes\":%u}\n",
+        g_h264_running?"true":"false", (unsigned)g_h264_frames, (unsigned)g_h264_bytes);
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, buf, n);
+}
+
+// Initialize esp_video stack (CSI + ISP registration)
+static void video_stack_init(void){
+    // Provide explicit SCCB/I2C + optional RESET/PWDN so init doesn't rely on menuconfig coupling
+    int sda = CONFIG_P4_SCCB_SDA_GPIO;
+    int scl = CONFIG_P4_SCCB_SCL_GPIO;
+    int port = CONFIG_P4_SCCB_PORT;
+    if (sda < 0 || scl < 0) {
+        sda = 7;
+        scl = 8;
+        LOGW("SCCB pins unset in Kconfig; defaulting to SDA=%d SCL=%d on port %d", sda, scl, port);
+    } else {
+        LOGI("SCCB pins: SDA=%d SCL=%d on port %d", sda, scl, port);
+    }
+    esp_video_init_sccb_config_t sccb = {
+        .init_sccb = true,
+        .i2c_config = {
+            .port = port,
+            .scl_pin = scl,
+            .sda_pin = sda,
+        },
+        .freq = 400000,
+    };
+    esp_video_init_csi_config_t csi = {
+        .sccb_config = sccb,
+        .reset_pin = CONFIG_P4_SCCB_RESET_GPIO,
+        .pwdn_pin  = CONFIG_P4_SCCB_PWDN_GPIO,
+    };
+    esp_video_init_config_t vc = {
+        .csi = &csi,
+        .dvp = NULL,
+        .jpeg = NULL,
+    };
+    esp_err_t e = esp_video_init(&vc);
+    if (e != ESP_OK) LOGE("esp_video_init -> %s (0x%x)", esp_err_to_name(e), e);
+    else LOGI("esp_video_init: OK");
+}
 
 // (duplicate start_web/ws_handler block removed)
 
@@ -373,21 +468,21 @@ static const char* find_video_node(void){
 // --------------------- I2C/SCCB smoke test helpers ---------------------
 #if CONFIG_P4_DEBUG_ENABLE_I2C_SMOKE
 static esp_err_t i2c_smoke_init(void){
-    if (CONFIG_P4_SCCB_SDA_GPIO < 0 || CONFIG_P4_SCCB_SCL_GPIO < 0) {
-        LOGW("I2C smoke: pins not set (menu: P4 Debug Options)");
-        return ESP_ERR_INVALID_ARG;
-    }
+    int sda = CONFIG_P4_SCCB_SDA_GPIO;
+    int scl = CONFIG_P4_SCCB_SCL_GPIO;
+    int port = CONFIG_P4_SCCB_PORT;
+    if (sda < 0 || scl < 0) { sda = 7; scl = 8; LOGW("I2C smoke: defaulting pins to SDA=%d SCL=%d (port %d)", sda, scl, port); }
     i2c_config_t c = {
         .mode = I2C_MODE_MASTER,
-        .sda_io_num = CONFIG_P4_SCCB_SDA_GPIO,
+        .sda_io_num = sda,
         .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_io_num = CONFIG_P4_SCCB_SCL_GPIO,
+        .scl_io_num = scl,
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
         .master.clk_speed = CONFIG_P4_I2C_SMOKE_SPEED_HZ
     };
-    esp_err_t e = i2c_param_config(CONFIG_P4_SCCB_PORT, &c);
+    esp_err_t e = i2c_param_config(port, &c);
     if (e != ESP_OK) return e;
-    return i2c_driver_install(CONFIG_P4_SCCB_PORT, I2C_MODE_MASTER, 0, 0, 0);
+    return i2c_driver_install(port, I2C_MODE_MASTER, 0, 0, 0);
 }
 
 static bool i2c_probe_addr(uint8_t addr7){
@@ -431,6 +526,11 @@ static bool ov5647_read_id(uint8_t addr7, uint8_t *id_high, uint8_t *id_low){
 }
 
 static void sccb_smoke_test(void){
+    // Determine pins (use defaults if unset)
+    int sda = CONFIG_P4_SCCB_SDA_GPIO;
+    int scl = CONFIG_P4_SCCB_SCL_GPIO;
+    int port = CONFIG_P4_SCCB_PORT;
+    if (sda < 0 || scl < 0) { sda = 7; scl = 8; }
     if (i2c_smoke_init() != ESP_OK) return;
 #if CONFIG_P4_DEBUG_TOGGLE_RESET
     if (CONFIG_P4_SCCB_RESET_GPIO >= 0){
@@ -447,7 +547,7 @@ static void sccb_smoke_test(void){
     }
 #endif
     LOGW("I2C smoke: scanning on port %d SDA=%d SCL=%d speed=%d",
-         CONFIG_P4_SCCB_PORT, CONFIG_P4_SCCB_SDA_GPIO, CONFIG_P4_SCCB_SCL_GPIO, CONFIG_P4_I2C_SMOKE_SPEED_HZ);
+         port, sda, scl, CONFIG_P4_I2C_SMOKE_SPEED_HZ);
     for (uint8_t a=0x08; a<0x78; ++a){ if (i2c_probe_addr(a)) LOGI("I2C ACK at 0x%02X", a); }
     uint8_t cand[2] = {0x36, 0x21};
     for (int i=0;i<2;i++){
@@ -730,6 +830,112 @@ static void cam_probe_once(void) {
 }
 
 
+// -------------------------- Minimal H.264 encode task --------------------------
+static inline void i420_to_ouyy_evyy(uint8_t *dst, const uint8_t *src, int w, int h){
+    const uint8_t *Y = src;
+    const uint8_t *U = Y + (size_t)w*h;
+    const uint8_t *V = U + ((size_t)w*h>>2);
+    uint8_t *dp = dst;
+    for (int j=0; j<h; j+=2){
+        const uint8_t *y0 = Y + (size_t)j*w;
+        const uint8_t *u0 = U + (size_t)(j/2)*(w/2);
+        for (int i=0; i<w; i+=2){ *dp++ = u0[i/2]; *dp++ = y0[i+0]; *dp++ = y0[i+1]; }
+        const uint8_t *y1 = Y + (size_t)(j+1)*w;
+        const uint8_t *v0 = V + (size_t)(j/2)*(w/2);
+        for (int i=0; i<w; i+=2){ *dp++ = v0[i/2]; *dp++ = y1[i+0]; *dp++ = y1[i+1]; }
+    }
+}
+static void h264_task(void *arg){
+    const char *dev = find_video_node();
+    if (!dev){ vTaskDelay(pdMS_TO_TICKS(1000)); dev = find_video_node(); }
+    if (!dev){ LOGW("h264: no /dev/video* (camera not detected) — skipping"); vTaskDelete(NULL); return; }
+
+    int fd = open(dev, O_RDWR);
+    if (fd < 0){ LOGW("h264: open(%s) failed", dev); vTaskDelete(NULL); return; }
+
+    int w = 640, h = 480;
+    struct v4l2_format fmt = {0};
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width  = w;
+    fmt.fmt.pix.height = h;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420; // I420
+    fmt.fmt.pix.field = V4L2_FIELD_NONE;
+    if (ioctl(fd, VIDIOC_S_FMT, &fmt) != 0){ LOGE("h264: S_FMT I420 %dx%d failed", w, h); close(fd); vTaskDelete(NULL); return; }
+    w = fmt.fmt.pix.width; h = fmt.fmt.pix.height;
+    LOGI("h264: capture fmt -> %ux%u fourcc=0x%08x", w, h, fmt.fmt.pix.pixelformat);
+
+    struct v4l2_requestbuffers req = {0};
+    req.count = 3; req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; req.memory = V4L2_MEMORY_MMAP;
+    if (ioctl(fd, VIDIOC_REQBUFS, &req) != 0 || req.count < 2){ LOGE("h264: REQBUFS MMAP failed (count=%u)", req.count); close(fd); vTaskDelete(NULL); return; }
+    void *buf_ptr[4] = {0}; size_t buf_len[4] = {0};
+    for (uint32_t i=0;i<req.count;i++){
+        struct v4l2_buffer b = {0}; b.type = req.type; b.memory = req.memory; b.index = i;
+        if (ioctl(fd, VIDIOC_QUERYBUF, &b) != 0){ LOGE("h264: QUERYBUF %u failed", i); goto stop_close; }
+        buf_ptr[i] = mmap(NULL, b.length, PROT_READ|PROT_WRITE, MAP_SHARED, fd, b.m.offset);
+        buf_len[i] = b.length;
+        if (buf_ptr[i] == MAP_FAILED){ LOGE("h264: mmap failed idx=%u", i); goto stop_close; }
+        if (ioctl(fd, VIDIOC_QBUF, &b) != 0){ LOGE("h264: QBUF %u failed", i); goto stop_close; }
+    }
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(fd, VIDIOC_STREAMON, &type) != 0){ LOGE("h264: STREAMON failed"); goto stop_close; }
+
+    esp_h264_enc_cfg_hw_t cfg = {0};
+    cfg.pic_type = ESP_H264_RAW_FMT_O_UYY_E_VYY; // packed 4:2:0 expected by HW
+    cfg.gop = 30; cfg.fps = 30;
+    cfg.res.width = w; cfg.res.height = h;
+    cfg.rc.bitrate = 2*1024*1024; cfg.rc.qp_min = 20; cfg.rc.qp_max = 45;
+
+    esp_h264_enc_handle_t enc = NULL;
+    if (esp_h264_enc_hw_new(&cfg, &enc) != ESP_H264_ERR_OK || !enc){ LOGE("h264: enc_new failed"); goto stop_stream; }
+    if (esp_h264_enc_open(enc) != ESP_H264_ERR_OK){ LOGE("h264: enc_open failed"); goto del_enc; }
+
+    // Buffers used by HW encoder must be cacheline-aligned (64B) and sizes often
+    // rounded to cacheline multiples to satisfy esp_cache_msync requirements.
+    size_t yuv_len = (size_t)w*h + ((size_t)w*h>>1);
+    const size_t ALIGN = 64;
+    size_t out_cap = 512*1024;
+    // Allocate with 64B alignment in PSRAM
+    uint8_t *wrk    = (uint8_t*)heap_caps_aligned_alloc(ALIGN, yuv_len,   MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+    uint8_t *outbuf = (uint8_t*)heap_caps_aligned_alloc(ALIGN, out_cap,   MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+    if (!wrk || !outbuf){ LOGE("h264: SPIRAM alloc failed"); goto close_enc; }
+
+    g_h264_running = true;
+    TickType_t last_log = xTaskGetTickCount();
+    for(;;){
+        struct v4l2_buffer b = {0}; b.type = req.type; b.memory = req.memory;
+        if (ioctl(fd, VIDIOC_DQBUF, &b) != 0){ LOGW("h264: DQBUF failed"); break; }
+
+        // Convert I420 (Y,U,V planes) read from MMAP buffer
+        i420_to_ouyy_evyy(wrk, (const uint8_t*)buf_ptr[b.index], w, h);
+        esp_h264_enc_in_frame_t in = { .raw_data = { .buffer = wrk,    .len = yuv_len }, .pts = 0 };
+        esp_h264_enc_out_frame_t out = { .raw_data = { .buffer = outbuf, .len = out_cap } };
+        esp_h264_err_t er = esp_h264_enc_process(enc, &in, &out);
+        if (er == ESP_H264_ERR_OK){ g_h264_frames++; g_h264_bytes += out.length; }
+        else { LOGW("h264: process err=%d", er); }
+
+        if (ioctl(fd, VIDIOC_QBUF, &b) != 0){ LOGW("h264: QBUF after DQBUF failed"); break; }
+        if (xTaskGetTickCount() - last_log > pdMS_TO_TICKS(2000)){
+            last_log = xTaskGetTickCount();
+            LOGI("h264: frames=%u bytes=%u", (unsigned)g_h264_frames, (unsigned)g_h264_bytes);
+        }
+    }
+
+    g_h264_running = false;
+    if (wrk) heap_caps_free(wrk);
+    if (outbuf) heap_caps_free(outbuf);
+close_enc:
+    esp_h264_enc_close(enc);
+del_enc:
+    esp_h264_enc_del(enc);
+stop_stream:
+    type = req.type; ioctl(fd, VIDIOC_STREAMOFF, &type);
+stop_close:
+    for (uint32_t i=0;i<req.count;i++) if (buf_ptr[i]) munmap(buf_ptr[i], buf_len[i]);
+    close(fd);
+    vTaskDelete(NULL);
+}
+
+
 #ifdef CONFIG_HTTPD_WS_SUPPORT
 // Forward declaration so start_web() can reference ws_handler
 static esp_err_t ws_handler(httpd_req_t *req);
@@ -755,6 +961,7 @@ static httpd_handle_t start_web(void) {
     httpd_uri_t u_dev     = { .uri="/dev",     .method=HTTP_GET,  .handler=dev_get     };
     httpd_uri_t u_i2c     = { .uri="/i2c",     .method=HTTP_GET,  .handler=i2c_get     };
     httpd_uri_t u_probe   = { .uri="/probe",   .method=HTTP_GET,  .handler=probe_get   };
+    httpd_uri_t u_h264    = { .uri="/h264.stats", .method=HTTP_GET, .handler=h264_stats_get };
     httpd_uri_t u_kcfg    = { .uri="/kcfg",    .method=HTTP_GET,  .handler=kcfg_get    };
     httpd_uri_t u_pad_g   = { .uri="/pad",     .method=HTTP_GET,  .handler=pad_handler };
     httpd_uri_t u_pad_p   = { .uri="/pad",     .method=HTTP_POST, .handler=pad_handler };
@@ -768,11 +975,12 @@ static httpd_handle_t start_web(void) {
     TRY( httpd_register_uri_handler(h, &u_i2c) );
     TRY( httpd_register_uri_handler(h, &u_probe) );
     TRY( httpd_register_uri_handler(h, &u_kcfg) );
+    TRY( httpd_register_uri_handler(h, &u_h264) );
 #ifdef CONFIG_HTTPD_WS_SUPPORT
     httpd_uri_t u_ws = { .uri="/ws", .method=HTTP_GET, .handler=ws_handler, .user_ctx=NULL, .is_websocket = true };
     TRY( httpd_register_uri_handler(h, &u_ws) );
     g_httpd = h;
-    // Launch lightweight video sender task (will push JPEG frames when available)
+    // Launch lightweight WS tick task (placeholder)
     xTaskCreatePinnedToCore(video_task, "vid", 4096, NULL, 5, NULL, tskNO_AFFINITY);
 #else
     LOGW("WebSocket not enabled (CONFIG_HTTPD_WS_SUPPORT). /ws will 404.");
@@ -857,6 +1065,9 @@ void app_main(void)
     esp_log_level_set("isp", ESP_LOG_DEBUG);
 
     ensure_nvs();
+    log_ram();
+    // Bring up esp_video stack before probing CSI
+    video_stack_init();
     // Quick platform dump
     esp_chip_info_t chip; esp_chip_info(&chip);
     LOGI("Chip: model=%d cores=%d rev=%d features=0x%x", chip.model, chip.cores, chip.revision, chip.features);
@@ -906,5 +1117,7 @@ void app_main(void)
     esp_log_level_set("esp_video_vfs", ESP_LOG_DEBUG);
     esp_log_level_set("esp_cam_sensor", ESP_LOG_DEBUG);
     cam_probe_once();
+    // Start minimal H.264 encode loop (NV12 -> HW encoder), non-fatal if camera absent
+    xTaskCreatePinnedToCore(h264_task, "h264", 8192, NULL, 5, NULL, tskNO_AFFINITY);
     LOGW("Browse http://<ip>/status (JSON) and http://<ip>/latency for the gamepad RTT demo");
 }

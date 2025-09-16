@@ -15,12 +15,12 @@ config P4_SCCB_PORT
 config P4_SCCB_SDA_GPIO
     int "SCCB SDA GPIO"
     depends on P4_DEBUG_ENABLE_I2C_SMOKE
-    default -1
+    default 7
 
 config P4_SCCB_SCL_GPIO
     int "SCCB SCL GPIO"
     depends on P4_DEBUG_ENABLE_I2C_SMOKE
-    default -1
+    default 8
 
 config P4_I2C_SMOKE_SPEED_HZ
     int "I2C smoke test speed (Hz)"
