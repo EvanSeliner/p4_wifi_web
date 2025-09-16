@@ -166,13 +166,16 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *buf, size_t len){
 }
 
 static bool hmac_sha1(const uint8_t *key, size_t keylen, const uint8_t *msg, size_t msglen, uint8_t out20[20]){
-    mbedtls_md_context_t ctx; const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA1);
-    if (!info) return false; mbedtls_md_init(&ctx);
+    mbedtls_md_context_t ctx;
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA1);
+    if (!info) return false;
+    mbedtls_md_init(&ctx);
     if (mbedtls_md_setup(&ctx, info, 1) != 0) { mbedtls_md_free(&ctx); return false; }
     if (mbedtls_md_hmac_starts(&ctx, key, keylen) != 0) { mbedtls_md_free(&ctx); return false; }
     if (mbedtls_md_hmac_update(&ctx, msg, msglen) != 0) { mbedtls_md_free(&ctx); return false; }
     if (mbedtls_md_hmac_finish(&ctx, out20) != 0) { mbedtls_md_free(&ctx); return false; }
-    mbedtls_md_free(&ctx); return true;
+    mbedtls_md_free(&ctx);
+    return true;
 }
 
 static uint16_t rd16(const uint8_t *p){ return (uint16_t)((p[0]<<8)|p[1]); }
@@ -932,11 +935,20 @@ static esp_err_t webrtc_offer_post(httpd_req_t *r)
     LOGI("/webrtc/offer: got %d bytes", got);
     // Parse minimal fields from offer: remote ice-ufrag and ice-pwd
     memset(&g_sess, 0, sizeof(g_sess));
-    const char *p = offer; for(;;){
-        const char *ln = strstr(p, "\n"); size_t L = ln ? (size_t)(ln - p) : strlen(p);
-        if (L >= 10 && strncmp(p, "a=ice-ufrag:", 12) == 0){ size_t n=L-12; if (n >= sizeof(g_sess.remote_ufrag)) n = sizeof(g_sess.remote_ufrag)-1; memcpy(g_sess.remote_ufrag, p+12, n); g_sess.remote_ufrag[n]='\0'; }
-        if (L >= 8+12 && strncmp(p, "a=ice-pwd:", 10) == 0){ size_t n=L-10; if (n >= sizeof(g_sess.remote_pwd))   n = sizeof(g_sess.remote_pwd)-1;   memcpy(g_sess.remote_pwd,   p+10, n); g_sess.remote_pwd[n]='\0'; }
-        if (!ln) break; p = ln+1;
+    const char *p = offer;
+    for(;;){
+        const char *ln = strstr(p, "\n");
+        size_t L = ln ? (size_t)(ln - p) : strlen(p);
+        if (L >= 12 && strncmp(p, "a=ice-ufrag:", 12) == 0){
+            size_t n=L-12; if (n >= sizeof(g_sess.remote_ufrag)) n = sizeof(g_sess.remote_ufrag)-1;
+            memcpy(g_sess.remote_ufrag, p+12, n); g_sess.remote_ufrag[n]='\0';
+        }
+        if (L >= 10 && strncmp(p, "a=ice-pwd:", 10) == 0){
+            size_t n=L-10; if (n >= sizeof(g_sess.remote_pwd)) n = sizeof(g_sess.remote_pwd)-1;
+            memcpy(g_sess.remote_pwd, p+10, n); g_sess.remote_pwd[n]='\0';
+        }
+        if (!ln) break;
+        p = ln+1;
     }
     // Generate our local creds
     make_rand_token(g_sess.local_ufrag, sizeof(g_sess.local_ufrag));
