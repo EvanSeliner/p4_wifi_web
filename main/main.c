@@ -210,11 +210,19 @@ static void stun_task(void *arg){
         if (!parse_attr_find(buf, n, 0x0006, &uval, &ulen, &uoff)) { LOGW("STUN: no USERNAME"); continue; }
         const char *colon = memchr(uval, ':', ulen);
         if (!colon) { LOGW("STUN: USERNAME missing colon"); continue; }
-        size_t lrem = (size_t)(colon - (const char*)uval);
-        size_t lloc = (size_t)ulen - lrem - 1;
-        if (lrem >= sizeof(s->remote_ufrag) || lloc >= sizeof(s->local_ufrag)) { LOGW("STUN: USERNAME length mismatch"); continue; }
-        if (strncmp((const char*)uval, s->remote_ufrag, lrem) != 0) { LOGW("STUN: ufrag(remote) mismatch"); continue; }
-        if (strncmp(colon+1, s->local_ufrag, lloc) != 0) { LOGW("STUN: ufrag(local) mismatch"); continue; }
+        size_t lleft = (size_t)(colon - (const char*)uval);
+        size_t lright = (size_t)ulen - lleft - 1;
+        // Accept either order per RFC 8445 semantics: client may send local:remote where local=receiver's ufrag
+        bool name_ok = false;
+        if (lleft == strlen(s->local_ufrag) && lright == strlen(s->remote_ufrag) &&
+            memcmp(uval, s->local_ufrag, lleft) == 0 && memcmp(colon+1, s->remote_ufrag, lright) == 0) {
+            name_ok = true;
+        }
+        if (!name_ok && lleft == strlen(s->remote_ufrag) && lright == strlen(s->local_ufrag) &&
+            memcmp(uval, s->remote_ufrag, lleft) == 0 && memcmp(colon+1, s->local_ufrag, lright) == 0) {
+            name_ok = true;
+        }
+        if (!name_ok) { LOGW("STUN: USERNAME mismatch left='%.*s' right='%.*s'", (int)lleft, (const char*)uval, (int)lright, colon+1); continue; }
 
         // Verify MESSAGE-INTEGRITY (HMAC-SHA1 with remote ice-pwd)
         const uint8_t *mival=NULL; uint16_t milen=0; size_t mioff=0;
