@@ -927,6 +927,7 @@ static char* build_sdp_answer(const char *ip, uint16_t rtp_port)
         "a=candidate:1 1 udp 2130706431 %s %u typ host generation 0\r\n",
         ip, (unsigned)rtp_port, ip, ufrag, pwd, fp, ip, (unsigned)rtp_port);
     if (n <= 0) { free(s); return NULL; }
+    LOGI("ICE answer: local_ufrag='%s' port=%u", ufrag, (unsigned)rtp_port);
     return s;
 }
 
@@ -960,22 +961,28 @@ static esp_err_t webrtc_offer_post(httpd_req_t *r)
         p = ln+1;
     }
     LOGI("ICE: remote ufrag='%s' pwd(len=%u)", g_sess.remote_ufrag, (unsigned)strlen(g_sess.remote_pwd));
-    // Generate our local creds
-    make_rand_token(g_sess.local_ufrag, sizeof(g_sess.local_ufrag));
-    make_rand_token(g_sess.local_pwd,   sizeof(g_sess.local_pwd));
-    // Open UDP socket for RTP/RTCP-mux
-    int sock = socket(AF_INET, SOCK_DGRAM, 0); g_sess.sock = sock;
-    struct sockaddr_in sa = { .sin_family = AF_INET, .sin_addr.s_addr = INADDR_ANY };
-    // Try a few ports starting at 52000
-    uint16_t base = 52000; int bound = 0;
-    for (int i=0;i<10 && !bound;i++){
-        sa.sin_port = htons(base + i);
-        if (bind(sock, (struct sockaddr*)&sa, sizeof(sa)) == 0){ g_sess.local_port = base+i; bound=1; break; }
+    // Generate our local creds once; reuse across offers to avoid race with in-flight checks
+    if (g_sess.local_ufrag[0] == '\0') make_rand_token(g_sess.local_ufrag, sizeof(g_sess.local_ufrag));
+    if (g_sess.local_pwd[0]   == '\0') make_rand_token(g_sess.local_pwd,   sizeof(g_sess.local_pwd));
+    // Open UDP socket for RTP/RTCP-mux once and keep it
+    if (g_sess.sock <= 0){
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock >= 0){
+            g_sess.sock = sock;
+            struct sockaddr_in sa = { 0 };
+            sa.sin_family = AF_INET; sa.sin_addr.s_addr = INADDR_ANY;
+            // Try a few ports starting at 52000
+            uint16_t base = 52000; int bound = 0;
+            for (int i=0;i<10 && !bound;i++){
+                sa.sin_port = htons(base + i);
+                if (bind(sock, (struct sockaddr*)&sa, sizeof(sa)) == 0){ g_sess.local_port = base+i; bound=1; break; }
+            }
+            // Launch STUN responder task
+            xTaskCreatePinnedToCore(stun_task, "stun", 4096, NULL, 5, NULL, tskNO_AFFINITY);
+        }
     }
     uint16_t rtp_port = g_sess.local_port ? g_sess.local_port : 52000;
     const char *ip = s_ip_str[0] ? s_ip_str : "192.168.0.2";
-    // Launch STUN responder task
-    xTaskCreatePinnedToCore(stun_task, "stun", 4096, NULL, 5, NULL, tskNO_AFFINITY);
     char *answer = build_sdp_answer(ip, rtp_port);
     free(offer);
     if (!answer) return httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "sdp build fail");
