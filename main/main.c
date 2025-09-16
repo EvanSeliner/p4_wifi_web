@@ -273,7 +273,7 @@ static void ip_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
         LOGI("Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_sta_got_ip = true;
         xEventGroupSetBits(s_ev, BIT_GOT_IP);
-        ip4addr_ntoa_r(&event->ip_info.ip, s_ip_str, sizeof(s_ip_str));
+        ip4addr_ntoa_r((const ip4_addr_t*)&event->ip_info.ip, s_ip_str, sizeof(s_ip_str));
     }
 }
 
