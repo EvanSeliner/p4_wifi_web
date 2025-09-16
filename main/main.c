@@ -939,6 +939,7 @@ static esp_err_t webrtc_offer_post(httpd_req_t *r)
     for(;;){
         const char *ln = strstr(p, "\n");
         size_t L = ln ? (size_t)(ln - p) : strlen(p);
+        if (L && p[L-1] == '\r') L--; // trim CR from CRLF
         if (L >= 12 && strncmp(p, "a=ice-ufrag:", 12) == 0){
             size_t n=L-12; if (n >= sizeof(g_sess.remote_ufrag)) n = sizeof(g_sess.remote_ufrag)-1;
             memcpy(g_sess.remote_ufrag, p+12, n); g_sess.remote_ufrag[n]='\0';
@@ -950,6 +951,7 @@ static esp_err_t webrtc_offer_post(httpd_req_t *r)
         if (!ln) break;
         p = ln+1;
     }
+    LOGI("ICE: remote ufrag='%s' pwd(len=%u)", g_sess.remote_ufrag, (unsigned)strlen(g_sess.remote_pwd));
     // Generate our local creds
     make_rand_token(g_sess.local_ufrag, sizeof(g_sess.local_ufrag));
     make_rand_token(g_sess.local_pwd,   sizeof(g_sess.local_pwd));
