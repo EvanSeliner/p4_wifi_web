@@ -31,6 +31,9 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include "linux/videodev2.h"
 #include "esp_video_device.h"
 #include "esp_video_init.h"
@@ -38,6 +41,7 @@
 #include "esp_h264_enc_single_hw.h"
 #include "esp_h264_alloc.h"
 #include "esp_heap_caps.h"
+#include "mbedtls/md.h"
 #ifdef CONFIG_SPIRAM
 #include "esp_psram.h"
 #endif
@@ -139,6 +143,124 @@ static httpd_handle_t g_httpd = NULL;
 static int s_ws_fd = -1;
 #endif
 static char s_ip_str[16] = {0};
+
+// ------------------------- Minimal ICE-lite session -------------------------
+typedef struct {
+    char   remote_ufrag[64];
+    char   remote_pwd[128];
+    char   local_ufrag[16];
+    char   local_pwd[48];
+    int    sock;                    // RTP/RTCP-mux UDP socket
+    uint16_t local_port;            // advertised RTP port
+    struct sockaddr_in peer_addr;   // learned from STUN request
+    bool   have_peer;
+    bool   ice_connected;
+} webrtc_sess_t;
+
+static webrtc_sess_t g_sess = {0};
+
+static uint32_t crc32_update(uint32_t crc, const uint8_t *buf, size_t len){
+    static uint32_t tbl[256]; static bool init=false;
+    if (!init){ for (uint32_t i=0;i<256;i++){ uint32_t c=i; for(int j=0;j<8;j++) c=(c&1)?(0xEDB88320^(c>>1)):(c>>1); tbl[i]=c; } init=true; }
+    crc = ~crc; for (size_t i=0;i<len;i++) crc = tbl[(crc ^ buf[i]) & 0xff] ^ (crc >> 8); return ~crc;
+}
+
+static bool hmac_sha1(const uint8_t *key, size_t keylen, const uint8_t *msg, size_t msglen, uint8_t out20[20]){
+    mbedtls_md_context_t ctx; const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA1);
+    if (!info) return false; mbedtls_md_init(&ctx);
+    if (mbedtls_md_setup(&ctx, info, 1) != 0) { mbedtls_md_free(&ctx); return false; }
+    if (mbedtls_md_hmac_starts(&ctx, key, keylen) != 0) { mbedtls_md_free(&ctx); return false; }
+    if (mbedtls_md_hmac_update(&ctx, msg, msglen) != 0) { mbedtls_md_free(&ctx); return false; }
+    if (mbedtls_md_hmac_finish(&ctx, out20) != 0) { mbedtls_md_free(&ctx); return false; }
+    mbedtls_md_free(&ctx); return true;
+}
+
+static uint16_t rd16(const uint8_t *p){ return (uint16_t)((p[0]<<8)|p[1]); }
+static void wr16(uint8_t *p, uint16_t v){ p[0]=(uint8_t)(v>>8); p[1]=(uint8_t)(v); }
+static void wr32(uint8_t *p, uint32_t v){ p[0]=(uint8_t)(v>>24); p[1]=(uint8_t)(v>>16); p[2]=(uint8_t)(v>>8); p[3]=(uint8_t)(v); }
+
+static bool parse_attr_find(const uint8_t *msg, size_t len, uint16_t want_type, const uint8_t **val, uint16_t *vlen, size_t *attr_off)
+{
+    if (len < 20) return false;
+    uint16_t mlen = rd16(msg+2); if (mlen+20 > len) return false;
+    size_t off = 20; while (off + 4 <= 20+mlen){
+        uint16_t t = rd16(msg+off), l = rd16(msg+off+2); size_t vpos = off+4; if (vpos + l > len) return false;
+        if (t == want_type){ if (val) *val = msg+vpos; if (vlen) *vlen = l; if (attr_off) *attr_off = off; return true; }
+        off = (vpos + l + 3) & ~3; // 4-byte align
+    }
+    return false;
+}
+
+static void stun_task(void *arg){
+    webrtc_sess_t *s = &g_sess;
+    uint8_t buf[1500]; struct sockaddr_in from; socklen_t flen = sizeof(from);
+    for(;;){
+        int n = recvfrom(s->sock, buf, sizeof(buf), 0, (struct sockaddr*)&from, &flen);
+        if (n <= 0) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
+        if (n < 20) continue;
+        uint16_t mtype = rd16(buf+0); uint16_t mlen = rd16(buf+2); uint32_t cookie = (buf[4]<<24)|(buf[5]<<16)|(buf[6]<<8)|buf[7];
+        if (cookie != 0x2112A442) continue; // not STUN
+        if (mtype != 0x0001) continue;      // not Binding Request
+
+        // Verify USERNAME is remoteUF:localUF
+        const uint8_t *uval=NULL; uint16_t ulen=0; size_t uoff=0;
+        if (!parse_attr_find(buf, n, 0x0006, &uval, &ulen, &uoff)) continue;
+        const char *colon = memchr(uval, ':', ulen);
+        if (!colon) continue;
+        size_t lrem = (size_t)(colon - (const char*)uval);
+        size_t lloc = (size_t)ulen - lrem - 1;
+        if (lrem >= sizeof(s->remote_ufrag) || lloc >= sizeof(s->local_ufrag)) continue;
+        if (strncmp((const char*)uval, s->remote_ufrag, lrem) != 0) continue;
+        if (strncmp(colon+1, s->local_ufrag, lloc) != 0) continue;
+
+        // Verify MESSAGE-INTEGRITY (HMAC-SHA1 with remote ice-pwd)
+        const uint8_t *mival=NULL; uint16_t milen=0; size_t mioff=0;
+        if (!parse_attr_find(buf, n, 0x0008, &mival, &milen, &mioff) || milen != 20) continue;
+        // Compute HMAC over message up to (but excluding) MI value
+        uint8_t calc[20];
+        uint8_t tmp[2] = { (uint8_t)((mioff-20)>>8), (uint8_t)((mioff-20)&0xFF) };
+        // Temporarily set message length to cover attrs up to MI header (excluding its 20B value)
+        uint8_t saved_len[2] = { buf[2], buf[3] };
+        buf[2] = tmp[0]; buf[3] = tmp[1];
+        if (!hmac_sha1((const uint8_t*)s->remote_pwd, strlen(s->remote_pwd), buf, mioff+4, calc)) { buf[2]=saved_len[0]; buf[3]=saved_len[1]; continue; }
+        buf[2]=saved_len[0]; buf[3]=saved_len[1];
+        if (memcmp(calc, mival, 20) != 0) continue;
+
+        // Build Binding Success Response
+        uint8_t out[256]; memset(out, 0, sizeof(out));
+        // Header
+        wr16(out+0, 0x0101); // Success Response
+        // Fill XOR-MAPPED-ADDRESS attribute first
+        size_t off = 20;
+        wr16(out+off+0, 0x0020); // XOR-MAPPED-ADDRESS
+        wr16(out+off+2, 8);
+        out[off+4] = 0; out[off+5] = 0x01; // IPv4
+        uint16_t xport = htons(from.sin_port) ^ 0x2112;
+        wr16(out+off+6, xport);
+        uint32_t xip = ntohl(from.sin_addr.s_addr) ^ 0x2112A442;
+        wr32(out+off+8, xip);
+        off += 12;
+        // MESSAGE-INTEGRITY (reserve and compute later)
+        wr16(out+off+0, 0x0008); wr16(out+off+2, 20); memset(out+off+4, 0, 20); size_t mi_pos = off; off += 24;
+        // FINGERPRINT (reserve)
+        wr16(out+off+0, 0x8028); wr16(out+off+2, 4); wr32(out+off+4, 0); size_t fp_pos = off; off += 8;
+        // Now write header with correct length
+        wr32(out+4, 0x2112A442); memcpy(out+8, buf+8, 12); // copy transaction ID
+        wr16(out+2, (uint16_t)(off - 20));
+        // Compute MI over message up to (but excluding) MI value
+        uint8_t mic[20]; uint8_t out_saved_len[2] = { out[2], out[3] };
+        uint16_t mi_len_for_hmac = (uint16_t)(mi_pos - 20 + 4); // include type+len of MI
+        out[2] = (uint8_t)(mi_len_for_hmac >> 8); out[3] = (uint8_t)(mi_len_for_hmac & 0xFF);
+        if (!hmac_sha1((const uint8_t*)s->remote_pwd, strlen(s->remote_pwd), out, mi_pos+4, mic)) { continue; }
+        memcpy(out+mi_pos+4, mic, 20);
+        out[2] = out_saved_len[0]; out[3] = out_saved_len[1];
+        // Compute FINGERPRINT over whole message up to FP attr value
+        uint32_t crc = crc32_update(0, out, fp_pos+4); crc ^= 0x5354554e; wr32(out+fp_pos+4, crc);
+        // Send
+        sendto(s->sock, out, off, 0, (struct sockaddr*)&from, sizeof(from));
+        s->peer_addr = from; s->have_peer = true; s->ice_connected = true;
+    }
+}
 
 // ---------------------- H.264 encode stats ----------------------
 static volatile uint32_t g_h264_frames = 0;
@@ -759,9 +881,10 @@ static void make_rand_token(char *out, size_t n)
 
 static char* build_sdp_answer(const char *ip, uint16_t rtp_port)
 {
+    // Use the session's local creds so STUN can verify USERNAME
     char ufrag[9], pwd[33];
-    make_rand_token(ufrag, sizeof(ufrag));
-    make_rand_token(pwd, sizeof(pwd));
+    strncpy(ufrag, g_sess.local_ufrag, sizeof(ufrag)); ufrag[sizeof(ufrag)-1]='\0';
+    strncpy(pwd,   g_sess.local_pwd,   sizeof(pwd));   pwd[sizeof(pwd)-1]='\0';
     // Dummy fingerprint (placeholder). DTLS implementation will replace this.
     const char *fp = "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00";
     char *s = malloc(1024);
@@ -803,9 +926,30 @@ static esp_err_t webrtc_offer_post(httpd_req_t *r)
     if (got < 0) { free(offer); return httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "recv fail"); }
     offer[got] = '\0';
     LOGI("/webrtc/offer: got %d bytes", got);
-    // TODO: parse minimal fields if needed. For now, we choose a static RTP port.
-    uint16_t rtp_port = 52000;
+    // Parse minimal fields from offer: remote ice-ufrag and ice-pwd
+    memset(&g_sess, 0, sizeof(g_sess));
+    const char *p = offer; for(;;){
+        const char *ln = strstr(p, "\n"); size_t L = ln ? (size_t)(ln - p) : strlen(p);
+        if (L >= 10 && strncmp(p, "a=ice-ufrag:", 12) == 0){ size_t n=L-12; if (n >= sizeof(g_sess.remote_ufrag)) n = sizeof(g_sess.remote_ufrag)-1; memcpy(g_sess.remote_ufrag, p+12, n); g_sess.remote_ufrag[n]='\0'; }
+        if (L >= 8+12 && strncmp(p, "a=ice-pwd:", 10) == 0){ size_t n=L-10; if (n >= sizeof(g_sess.remote_pwd))   n = sizeof(g_sess.remote_pwd)-1;   memcpy(g_sess.remote_pwd,   p+10, n); g_sess.remote_pwd[n]='\0'; }
+        if (!ln) break; p = ln+1;
+    }
+    // Generate our local creds
+    make_rand_token(g_sess.local_ufrag, sizeof(g_sess.local_ufrag));
+    make_rand_token(g_sess.local_pwd,   sizeof(g_sess.local_pwd));
+    // Open UDP socket for RTP/RTCP-mux
+    int sock = socket(AF_INET, SOCK_DGRAM, 0); g_sess.sock = sock;
+    struct sockaddr_in sa = { .sin_family = AF_INET, .sin_addr.s_addr = INADDR_ANY };
+    // Try a few ports starting at 52000
+    uint16_t base = 52000; int bound = 0;
+    for (int i=0;i<10 && !bound;i++){
+        sa.sin_port = htons(base + i);
+        if (bind(sock, (struct sockaddr*)&sa, sizeof(sa)) == 0){ g_sess.local_port = base+i; bound=1; break; }
+    }
+    uint16_t rtp_port = g_sess.local_port ? g_sess.local_port : 52000;
     const char *ip = s_ip_str[0] ? s_ip_str : "192.168.0.2";
+    // Launch STUN responder task
+    xTaskCreatePinnedToCore(stun_task, "stun", 4096, NULL, 5, NULL, tskNO_AFFINITY);
     char *answer = build_sdp_answer(ip, rtp_port);
     free(offer);
     if (!answer) return httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "sdp build fail");
