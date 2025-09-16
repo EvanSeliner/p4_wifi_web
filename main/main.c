@@ -197,7 +197,12 @@ static bool parse_attr_find(const uint8_t *msg, size_t len, uint16_t want_type, 
 static void stun_task(void *arg){
     webrtc_sess_t *s = &g_sess;
     uint8_t buf[1500]; struct sockaddr_in from; socklen_t flen = sizeof(from);
+    // Simple token bucket for STUN warn logs
+    static int stun_warn_budget = 20; // allow burst
+    int64_t last_refill_us = esp_timer_get_time();
     for(;;){
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - last_refill_us > 1000000) { stun_warn_budget = 20; last_refill_us = now_us; }
         int n = recvfrom(s->sock, buf, sizeof(buf), 0, (struct sockaddr*)&from, &flen);
         if (n <= 0) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
         if (n < 20) continue;
@@ -207,28 +212,41 @@ static void stun_task(void *arg){
 
         // Verify USERNAME is remoteUF:localUF
         const uint8_t *uval=NULL; uint16_t ulen=0; size_t uoff=0;
-        if (!parse_attr_find(buf, n, 0x0006, &uval, &ulen, &uoff)) { LOGW("STUN: no USERNAME"); continue; }
+        if (!parse_attr_find(buf, n, 0x0006, &uval, &ulen, &uoff)) { if (stun_warn_budget-->0) LOGW("STUN: no USERNAME"); continue; }
         const char *colon = memchr(uval, ':', ulen);
-        if (!colon) { LOGW("STUN: USERNAME missing colon"); continue; }
+        if (!colon) { if (stun_warn_budget-->0) LOGW("STUN: USERNAME missing colon"); continue; }
         size_t lleft = (size_t)(colon - (const char*)uval);
         (void)lleft; // only used for logging if needed
         char uname[128]; size_t ul = ulen < sizeof(uname)-1 ? ulen : sizeof(uname)-1; memcpy(uname, uval, ul); uname[ul] = '\0';
         char ex1[128]; char ex2[128];
         // Build ex1 = local:remote safely
         size_t ll = strlen(s->local_ufrag); size_t lr = strlen(s->remote_ufrag);
-        if (ll + 1 + lr >= sizeof(ex1)) { LOGW("STUN: expected USERNAME too long (local+remote)"); continue; }
+        if (ll + 1 + lr >= sizeof(ex1)) { if (stun_warn_budget-->0) LOGW("STUN: expected USERNAME too long (local+remote)"); continue; }
         memcpy(ex1, s->local_ufrag, ll); ex1[ll] = ':'; memcpy(ex1+ll+1, s->remote_ufrag, lr); ex1[ll+1+lr] = '\0';
         // Build ex2 = remote:local safely
-        if (lr + 1 + ll >= sizeof(ex2)) { LOGW("STUN: expected USERNAME too long (remote+local)"); continue; }
+        if (lr + 1 + ll >= sizeof(ex2)) { if (stun_warn_budget-->0) LOGW("STUN: expected USERNAME too long (remote+local)"); continue; }
         memcpy(ex2, s->remote_ufrag, lr); ex2[lr] = ':'; memcpy(ex2+lr+1, s->local_ufrag, ll); ex2[lr+1+ll] = '\0';
         if (strcmp(uname, ex1) != 0 && strcmp(uname, ex2) != 0) {
-            LOGW("STUN: USERNAME mismatch got='%s' ex1='%s' ex2='%s'", uname, ex1, ex2);
-            continue;
+            // As a fallback during bring-up, accept prefix match of local ufrag (some peers truncate on retries)
+            bool accept = false;
+            size_t uname_len = strlen(uname);
+            const char *sep = strchr(uname, ':');
+            if (sep) {
+                size_t lpart = (size_t)(sep - uname);
+                size_t rpart = uname_len - lpart - 1;
+                if (rpart == lr && memcmp(sep+1, s->remote_ufrag, lr) == 0 && lpart <= ll && memcmp(uname, s->local_ufrag, lpart) == 0) {
+                    accept = true; if (stun_warn_budget-->0) LOGW("STUN: accepting USERNAME prefix match '%s'", uname);
+                }
+            }
+            if (!accept) {
+                if (stun_warn_budget-->0) LOGW("STUN: USERNAME mismatch got='%s' ex1='%s' ex2='%s'", uname, ex1, ex2);
+                continue;
+            }
         }
 
         // Verify MESSAGE-INTEGRITY (HMAC-SHA1 with remote ice-pwd)
         const uint8_t *mival=NULL; uint16_t milen=0; size_t mioff=0;
-        if (!parse_attr_find(buf, n, 0x0008, &mival, &milen, &mioff) || milen != 20) { LOGW("STUN: no MESSAGE-INTEGRITY"); continue; }
+        if (!parse_attr_find(buf, n, 0x0008, &mival, &milen, &mioff) || milen != 20) { if (stun_warn_budget-->0) LOGW("STUN: no MESSAGE-INTEGRITY"); continue; }
         // Compute HMAC over message up to (but excluding) MI value
         uint8_t calc[20];
         uint8_t tmp[2] = { (uint8_t)((mioff-20)>>8), (uint8_t)((mioff-20)&0xFF) };
