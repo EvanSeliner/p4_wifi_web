@@ -79,6 +79,7 @@ static void log_ram(void){
 
 // WiFi via Hosted/Remote (forwards esp_wifi_* to C6 over SDIO)
 #include "esp_wifi_remote.h"
+#include "lwip/inet.h"
 
 static const char *TAG = "P4+C6";
 
@@ -130,11 +131,14 @@ static esp_err_t ws_handler(httpd_req_t *req);
 static void video_task(void *arg);
 static void h264_task(void *arg);
 static void video_stack_init(void);
+static esp_err_t webrtc_offer_post(httpd_req_t *r);
+static esp_err_t webrtc_js_get(httpd_req_t *r);
 
 static httpd_handle_t g_httpd = NULL;
 #ifdef CONFIG_HTTPD_WS_SUPPORT
 static int s_ws_fd = -1;
 #endif
+static char s_ip_str[16] = {0};
 
 // ---------------------- H.264 encode stats ----------------------
 static volatile uint32_t g_h264_frames = 0;
@@ -269,6 +273,7 @@ static void ip_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
         LOGI("Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_sta_got_ip = true;
         xEventGroupSetBits(s_ev, BIT_GOT_IP);
+        ip4addr_ntoa_r(&event->ip_info.ip, s_ip_str, sizeof(s_ip_str));
     }
 }
 
@@ -315,6 +320,20 @@ static void wifi_ap_start(void) {
 // Small JS fragment we append to the built-in index.html so the latency demo
 // lives on the main page. It creates a dot + counters and uses /pad for RTT.
 static const char k_index_inject[] = "<script src='/ui.js'></script>";
+static const char k_webrtc_js[] =
+"(async()=>{\n"
+"  try{\n"
+"    const v=document.createElement('video');v.autoplay=true;v.playsInline=true;v.muted=true;v.style.width='100%';v.style.maxWidth='640px';document.body.appendChild(v);\n"
+"    const pc=new RTCPeerConnection({iceServers:[]});\n"
+"    pc.addTransceiver('video',{direction:'recvonly'});\n"
+"    pc.ontrack=(e)=>{v.srcObject=e.streams[0];};\n"
+"    const offer=await pc.createOffer();\n"
+"    await pc.setLocalDescription(offer);\n"
+"    const res=await fetch('/webrtc/offer',{method:'POST',headers:{'Content-Type':'application/sdp'},body:offer.sdp});\n"
+"    const answer=await res.text();\n"
+"    await pc.setRemoteDescription({type:'answer',sdp:answer});\n"
+"  }catch(e){console.error('webrtc',e);}\n"
+"})();\n";
 
 // --- /ui.js: adds latency widget + WS indicator + frame counter to any page ---
 static const char k_ui_js[] =
@@ -725,6 +744,77 @@ static esp_err_t dev_get(httpd_req_t *r){
     return httpd_resp_send_chunk(r, NULL, 0);
 }
 
+// Minimal WebRTC client helper script
+static esp_err_t webrtc_js_get(httpd_req_t *r){
+    httpd_resp_set_type(r, "application/javascript");
+    return httpd_resp_send(r, k_webrtc_js, HTTPD_RESP_USE_STRLEN);
+}
+
+// --- Minimal ICE-lite SDP answer builder ---
+static char hexrand()
+{ const char* h="0123456789abcdef"; return h[esp_random() & 0xF]; }
+
+static void make_rand_token(char *out, size_t n)
+{ for(size_t i=0;i+1<n;i++) out[i]=hexrand(); out[n-1]='\0'; }
+
+static char* build_sdp_answer(const char *ip, uint16_t rtp_port)
+{
+    char ufrag[9], pwd[33];
+    make_rand_token(ufrag, sizeof(ufrag));
+    make_rand_token(pwd, sizeof(pwd));
+    // Dummy fingerprint (placeholder). DTLS implementation will replace this.
+    const char *fp = "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00";
+    char *s = malloc(1024);
+    if (!s) return NULL;
+    int n = snprintf(s, 1024,
+        "v=0\r\n"
+        "o=- 0 0 IN IP4 %s\r\n"
+        "s=ESP32-P4\r\n"
+        "t=0 0\r\n"
+        "a=ice-lite\r\n"
+        "a=group:BUNDLE 0\r\n"
+        "a=msid-semantic: WMS\r\n"
+        "m=video %u UDP/TLS/RTP/SAVPF 96\r\n"
+        "c=IN IP4 %s\r\n"
+        "a=rtcp-mux\r\n"
+        "a=setup:passive\r\n"
+        "a=mid:0\r\n"
+        "a=sendonly\r\n"
+        "a=ice-ufrag:%s\r\n"
+        "a=ice-pwd:%s\r\n"
+        "a=fingerprint:sha-256 %s\r\n"
+        "a=rtpmap:96 H264/90000\r\n"
+        "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f\r\n"
+        "a=ssrc:12345678 cname:esp\r\n"
+        "a=candidate:1 1 udp 2130706431 %s %u typ host generation 0\r\n",
+        ip, (unsigned)rtp_port, ip, ufrag, pwd, fp, ip, (unsigned)rtp_port);
+    if (n <= 0) { free(s); return NULL; }
+    return s;
+}
+
+// HTTP: /webrtc/offer — accept browser SDP offer and reply with ICE-lite answer
+static esp_err_t webrtc_offer_post(httpd_req_t *r)
+{
+    int len = r->content_len;
+    if (len <= 0 || len > 8192) return httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "bad sdp");
+    char *offer = (char*)malloc(len+1);
+    if (!offer) return httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+    int got = httpd_req_recv(r, offer, len);
+    if (got < 0) { free(offer); return httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "recv fail"); }
+    offer[got] = '\0';
+    LOGI("/webrtc/offer: got %d bytes", got);
+    // TODO: parse minimal fields if needed. For now, we choose a static RTP port.
+    uint16_t rtp_port = 52000;
+    const char *ip = s_ip_str[0] ? s_ip_str : "192.168.0.2";
+    char *answer = build_sdp_answer(ip, rtp_port);
+    free(offer);
+    if (!answer) return httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "sdp build fail");
+    httpd_resp_set_type(r, "application/sdp");
+    esp_err_t rc = httpd_resp_sendstr(r, answer);
+    free(answer);
+    return rc;
+}
+
 // HTTP: /probe — re-run camera probe and return JSON
 static void cam_probe_once(void); // forward
 static esp_err_t probe_get(httpd_req_t *r){
@@ -963,6 +1053,8 @@ static httpd_handle_t start_web(void) {
     httpd_uri_t u_probe   = { .uri="/probe",   .method=HTTP_GET,  .handler=probe_get   };
     httpd_uri_t u_h264    = { .uri="/h264.stats", .method=HTTP_GET, .handler=h264_stats_get };
     httpd_uri_t u_kcfg    = { .uri="/kcfg",    .method=HTTP_GET,  .handler=kcfg_get    };
+    httpd_uri_t u_webo    = { .uri="/webrtc/offer", .method=HTTP_POST, .handler=webrtc_offer_post };
+    httpd_uri_t u_webrtc  = { .uri="/webrtc.js", .method=HTTP_GET, .handler=webrtc_js_get };
     httpd_uri_t u_pad_g   = { .uri="/pad",     .method=HTTP_GET,  .handler=pad_handler };
     httpd_uri_t u_pad_p   = { .uri="/pad",     .method=HTTP_POST, .handler=pad_handler };
     TRY( httpd_register_uri_handler(h, &u_root) );
@@ -976,6 +1068,8 @@ static httpd_handle_t start_web(void) {
     TRY( httpd_register_uri_handler(h, &u_probe) );
     TRY( httpd_register_uri_handler(h, &u_kcfg) );
     TRY( httpd_register_uri_handler(h, &u_h264) );
+    TRY( httpd_register_uri_handler(h, &u_webo) );
+    TRY( httpd_register_uri_handler(h, &u_webrtc) );
 #ifdef CONFIG_HTTPD_WS_SUPPORT
     httpd_uri_t u_ws = { .uri="/ws", .method=HTTP_GET, .handler=ws_handler, .user_ctx=NULL, .is_websocket = true };
     TRY( httpd_register_uri_handler(h, &u_ws) );
